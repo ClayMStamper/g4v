@@ -43,7 +43,10 @@ impl RepoTab {
             ui.add(egui::Spinner::new());
             return;
         };
-        ui.label(RichText::new(&d.commit.subject).strong().size(15.0));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(d.commit.cl_label()).strong().size(15.0).color(theme::ACCENT));
+            ui.label(RichText::new(&d.commit.subject).strong().size(15.0));
+        });
         let body: String = d.message.lines().skip(1).collect::<Vec<_>>().join("\n");
         if !body.trim().is_empty() {
             ui.label(body.trim());
@@ -61,10 +64,21 @@ impl RepoTab {
                 ui.label(&d.committer);
                 ui.end_row();
             }
-            ui.label(theme::small("Change id"));
+            if d.commit.cl > 0 {
+                ui.label(theme::small("Changelist"));
+                ui.horizontal(|ui| {
+                    ui.label(d.commit.cl_label())
+                        .on_hover_text("This change's position in its branch history. It's the same for everyone.");
+                    if ui.small_button("Copy").clicked() {
+                        ui.ctx().copy_text(d.commit.cl.to_string());
+                    }
+                });
+                ui.end_row();
+            }
+            ui.label(theme::small("Git commit"));
             ui.horizontal(|ui| {
-                ui.monospace(d.commit.short_id());
-                if ui.small_button("Copy").clicked() {
+                ui.label(RichText::new(d.commit.short_id()).monospace().color(theme::MUTED)).on_hover_text(&d.commit.id);
+                if ui.small_button("Copy").on_hover_text(&d.commit.id).clicked() {
                     ui.ctx().copy_text(d.commit.id.clone());
                 }
             });

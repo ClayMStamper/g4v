@@ -413,3 +413,41 @@ fn changelists_persist_in_git_dir() {
     // Metadata lives inside .git, so it never shows up as a change.
     assert!(w.a.status().unwrap().files.is_empty());
 }
+
+#[test]
+fn changelist_numbers_follow_branch_order_and_match_between_clones() {
+    use g4v::git::history::HistoryScope;
+    let w = world();
+    // Alice submits two changes: CL 2 and CL 3 (the initial commit is CL 1).
+    for (i, text) in ["a2\n", "a3\n"].iter().enumerate() {
+        write(&w.a, "a.txt", text);
+        w.a.commit_paths(&paths(&["a.txt"]), &format!("alice {i}")).unwrap();
+    }
+    let log = w.a.log(&HistoryScope::Current, 100, true).unwrap();
+    assert_eq!(log.iter().map(|c| c.cl).collect::<Vec<_>>(), vec![3, 2, 1]);
+    assert_eq!(log[0].cl_label(), "CL #3");
+    assert_eq!(w.a.push_current().unwrap(), PushOutcome::Pushed);
+
+    // Bob's local change is CL 2 until he gets latest; rebasing it onto Alice's work makes it CL 4.
+    write(&w.b, "b.txt", "b2\n");
+    w.b.commit_paths(&paths(&["b.txt"]), "bob").unwrap();
+    assert_eq!(w.b.cl_of("HEAD").unwrap().1, 2);
+    w.b.sync(PullMode::Rebase, &[]).unwrap();
+    let (head, n) = w.b.cl_of("HEAD").unwrap();
+    assert_eq!(n, 4);
+    let blog = w.b.log(&HistoryScope::Current, 100, true).unwrap();
+    assert_eq!(blog.iter().map(|c| c.cl).collect::<Vec<_>>(), vec![4, 3, 2, 1]);
+    assert_eq!(blog[0].id, head);
+
+    // The same commit has the same number in every clone and in every view.
+    let alice_ids: Vec<(String, u64)> = log.iter().map(|c| (c.id.clone(), c.cl)).collect();
+    for (id, cl) in &alice_ids {
+        assert_eq!(blog.iter().find(|c| &c.id == id).map(|c| c.cl), Some(*cl));
+        assert_eq!(w.b.commit_detail(id).unwrap().commit.cl, *cl);
+    }
+    // A short window (the parent isn't loaded) and file history still get the right numbers.
+    let window = w.b.log(&HistoryScope::Current, 1, false).unwrap();
+    assert_eq!(window[0].cl, 4);
+    let file_log = w.b.log(&HistoryScope::File("a.txt".into()), 100, false).unwrap();
+    assert_eq!(file_log.iter().map(|c| c.cl).collect::<Vec<_>>(), vec![3, 2, 1]);
+}

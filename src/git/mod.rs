@@ -21,7 +21,7 @@ pub mod ops;
 pub mod shelf;
 pub mod status;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Write;
@@ -179,6 +179,9 @@ pub struct Repo {
     root: PathBuf,
     git_dir: PathBuf,
     log: CmdLog,
+    /// Changelist numbers already worked out (commit id -> CL #). A commit's number never changes, so this is never
+    /// invalidated. Shared by all clones of the repo (the UI and its worker threads).
+    pub(crate) cl_cache: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl fmt::Debug for Repo {
@@ -212,7 +215,7 @@ impl Repo {
         if root.as_os_str().is_empty() || git_dir.as_os_str().is_empty() {
             anyhow::bail!("Could not determine the repository layout of {}", path.display());
         }
-        Ok(Repo { root: normalize(root), git_dir: normalize(git_dir), log })
+        Ok(Repo { root: normalize(root), git_dir: normalize(git_dir), log, cl_cache: Arc::default() })
     }
 
     pub fn root(&self) -> &Path {

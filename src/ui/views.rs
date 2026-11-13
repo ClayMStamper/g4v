@@ -1256,7 +1256,9 @@ impl RepoTab {
                 reload = true;
             }
             ui.add(
-                egui::TextEdit::singleline(&mut self.history_filter).hint_text("🔍 Search description, author or id").desired_width(260.0),
+                egui::TextEdit::singleline(&mut self.history_filter)
+                    .hint_text("🔍 Search description, author or CL #")
+                    .desired_width(260.0),
             );
             if self.history_loading {
                 ui.add(egui::Spinner::new());
@@ -1273,20 +1275,26 @@ impl RepoTab {
             ui.label(theme::small("No submitted changes yet."));
             return;
         }
-        let filter = self.history_filter.to_lowercase();
+        let filter = self.history_filter.trim().to_lowercase();
+        // "42", "#42", "cl 42" and "CL #42" all find changelist 42.
+        let cl_query: Option<u64> = filter.trim_start_matches("cl").trim().trim_start_matches('#').trim().parse().ok();
         let visible: Vec<usize> = (0..self.history.len())
             .filter(|&i| {
                 let c = &self.history[i];
                 filter.is_empty()
+                    || cl_query.is_some_and(|n| c.cl == n)
                     || c.subject.to_lowercase().contains(&filter)
                     || c.author.to_lowercase().contains(&filter)
-                    || c.id.starts_with(&filter)
+                    || (filter.len() >= 4 && c.id.starts_with(&filter))
             })
             .collect();
         let show_graph = filter.is_empty();
         let max_lanes = if show_graph { self.graph.iter().map(|g| g.width).max().unwrap_or(1).min(12) } else { 0 };
         let lane_w = 14.0;
         let graph_w = max_lanes as f32 * lane_w + 8.0;
+        // Every changelist label is padded to the widest one so descriptions line up.
+        let max_label = visible.iter().map(|&i| self.history[i].cl_label().len()).max().unwrap_or(0);
+        let cl_sample = "8".repeat(max_label);
         let head = self.status.as_ref().and_then(|s| s.branch.oid.clone());
         let ahead = self.status.as_ref().map(|s| s.branch.ahead).unwrap_or(0);
         let has_upstream = self.status.as_ref().is_some_and(|s| s.branch.upstream.is_some());
@@ -1330,6 +1338,8 @@ impl RepoTab {
                         }
                         p.indent(graph_w);
                     }
+                    // Changelist number column (P4V's "Change" column); the Git id is in the tooltip and menu.
+                    p.column(&c.cl_label(), MUTED, &cl_sample);
                     for r in c.refs.iter().filter(|r| !r.ends_with("/HEAD")) {
                         let (label, color) = if let Some(b) = r.strip_prefix("HEAD -> ") {
                             (b.to_string(), GREEN)
@@ -1345,23 +1355,35 @@ impl RepoTab {
                         p.pill(&label, color);
                     }
                     let date = theme::format_time(c.time);
-                    p.right_text(c.short_id(), MUTED);
                     p.right_text(&date, MUTED);
                     let author_r = p.right_text(&c.author, MUTED);
                     let limit = author_r.left() - 12.0;
                     p.text_clipped(&c.subject, None, limit);
-                    let resp = resp.on_hover_text(format!("{}\n{} <{}>\n{}", c.subject, c.author, c.email, c.id));
+                    let resp = resp.on_hover_text(format!(
+                        "{} \u{2014} {}\n{} <{}>\nGit commit {}",
+                        c.cl_label(),
+                        c.subject,
+                        c.author,
+                        c.email,
+                        c.id
+                    ));
                     if resp.clicked() {
                         actions.push(Action::SelectCommit(c.id.clone()));
                     }
                     let id = c.id.clone();
+                    let cl = c.cl;
                     let is_merge = c.parents.len() > 1;
                     let is_head = head.as_deref() == Some(c.id.as_str());
                     resp.context_menu(|ui| {
-                        if ui.button("Copy change id").clicked() {
+                        if cl > 0 && ui.button(format!("Copy changelist number ({cl})")).clicked() {
+                            ui.ctx().copy_text(cl.to_string());
+                            ui.close();
+                        }
+                        if ui.button(format!("Copy Git commit id ({})", &id[..id.len().min(8)])).on_hover_text(&id).clicked() {
                             ui.ctx().copy_text(id.clone());
                             ui.close();
                         }
+                        ui.separator();
                         if ui.button("New branch from here…").clicked() {
                             actions.push(Action::NewBranch(Some(id.clone())));
                             ui.close();

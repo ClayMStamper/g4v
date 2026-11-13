@@ -1,5 +1,7 @@
 //! Commit history ("Submitted" changelists) and a simple lane graph.
 
+use std::collections::HashMap;
+
 use super::{GitResult, Repo};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,12 +14,72 @@ pub struct Commit {
     /// Decorations: branch / tag names pointing at this commit.
     pub refs: Vec<String>,
     pub subject: String,
+    /// Perforce-style changelist number (see [`Repo::assign_cl_numbers`]); 0 until assigned.
+    pub cl: u64,
 }
 
 impl Commit {
     pub fn short_id(&self) -> &str {
         &self.id[..self.id.len().min(8)]
     }
+
+    /// "CL #42", or the short hash if no number could be worked out.
+    pub fn cl_label(&self) -> String {
+        cl_label(self.cl, &self.id)
+    }
+}
+
+/// "CL #42", falling back to the short hash when the number is unknown (0).
+pub fn cl_label(cl: u64, id: &str) -> String {
+    if cl > 0 {
+        format!("CL #{cl}")
+    } else {
+        id[..id.len().min(8)].to_string()
+    }
+}
+
+/// Works out changelist numbers for `commits` from their first parents.
+///
+/// `known` holds numbers that are already known (cache and lookups). A commit's number is one more than its first
+/// parent's; a root commit is 1. Returns the first-parent ids that are neither loaded nor known, so the caller can look
+/// them up and call again. Commits that can't be resolved yet are left at 0.
+pub fn number_commits(commits: &mut [Commit], known: &mut HashMap<String, u64>) -> Vec<String> {
+    let index: HashMap<&str, usize> = commits.iter().enumerate().map(|(i, c)| (c.id.as_str(), i)).collect();
+    let mut numbers: Vec<u64> = commits.iter().map(|c| known.get(&c.id).copied().unwrap_or(0)).collect();
+    let mut missing = Vec::new();
+    for start in 0..commits.len() {
+        // Walk down the first-parent chain (child -> parent) until a commit whose number is known, a root, or a gap.
+        let mut chain = Vec::new();
+        let mut cur = start;
+        let base = loop {
+            if numbers[cur] > 0 {
+                break Some(numbers[cur]);
+            }
+            chain.push(cur);
+            let Some(parent) = commits[cur].parents.first() else { break Some(0) };
+            if let Some(&i) = index.get(parent.as_str()) {
+                cur = i;
+            } else if let Some(&n) = known.get(parent) {
+                break Some(n);
+            } else {
+                if !missing.contains(parent) {
+                    missing.push(parent.clone());
+                }
+                break None;
+            }
+        };
+        if let Some(mut n) = base {
+            for &i in chain.iter().rev() {
+                n += 1;
+                numbers[i] = n;
+                known.insert(commits[i].id.clone(), n);
+            }
+        }
+    }
+    for (c, n) in commits.iter_mut().zip(numbers) {
+        c.cl = n;
+    }
+    missing
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,6 +132,7 @@ pub fn parse_log(text: &str) -> Vec<Commit> {
                 time: f[4].parse().unwrap_or(0),
                 refs: f[5].split(", ").map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect(),
                 subject: f[6].trim_end().to_string(),
+                cl: 0,
             })
         })
         .collect()
@@ -198,7 +261,57 @@ impl Repo {
             Err(e) if e.stderr.contains("does not have any commits") || e.stderr.contains("unknown revision") => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
-        Ok(parse_log(&out.text()))
+        let mut commits = parse_log(&out.text());
+        self.assign_cl_numbers(&mut commits);
+        Ok(commits)
+    }
+
+    /// The changelist number of `rev` (see [`Repo::assign_cl_numbers`]) together with its full id.
+    pub fn cl_of(&self, rev: &str) -> GitResult<(String, u64)> {
+        let id = self.git().args(["rev-parse", "--verify", "--quiet"]).arg(format!("{rev}^{{commit}}")).run()?.text().trim().to_string();
+        if let Some(&n) = self.cl_cache.lock().ok().and_then(|c| c.get(&id).copied()).as_ref() {
+            return Ok((id, n));
+        }
+        let n: u64 = self.git().args(["rev-list", "--first-parent", "--count"]).arg(&id).run()?.text().trim().parse().unwrap_or(0);
+        if n > 0 {
+            if let Ok(mut c) = self.cl_cache.lock() {
+                c.insert(id.clone(), n);
+            }
+        }
+        Ok((id, n))
+    }
+
+    /// Fills in [`Commit::cl`]: the commit's position in its first-parent chain, counting the very first commit as 1.
+    ///
+    /// The number depends only on the commit, so it's the same for everyone and never changes once pushed, and along a
+    /// branch it goes up by one per change, like Perforce changelist numbers. Lookups are cached; failures leave 0
+    /// (the UI then shows the short hash), so history never fails because of numbering.
+    pub fn assign_cl_numbers(&self, commits: &mut [Commit]) {
+        let mut known = self.cl_cache.lock().map(|c| c.clone()).unwrap_or_default();
+        let mut missing = number_commits(commits, &mut known);
+        if !missing.is_empty() {
+            // Usually the gap is on the current branch: number its whole first-parent chain in one go.
+            if let Ok(out) = self.git().args(["rev-list", "--first-parent", "HEAD"]).quiet().run() {
+                let ids: Vec<String> = out.text().lines().map(str::to_string).collect();
+                let total = ids.len() as u64;
+                for (i, id) in ids.into_iter().enumerate() {
+                    known.insert(id, total - i as u64);
+                }
+            }
+            missing.retain(|p| !known.contains_key(p));
+            // Anything else (another branch, file history), one at a time.
+            for p in missing.iter().take(200) {
+                if let Ok(out) = self.git().args(["rev-list", "--first-parent", "--count"]).arg(p).quiet().run() {
+                    if let Ok(n) = out.text().trim().parse::<u64>() {
+                        known.insert(p.clone(), n);
+                    }
+                }
+            }
+            number_commits(commits, &mut known);
+        }
+        if let Ok(mut cache) = self.cl_cache.lock() {
+            *cache = known;
+        }
     }
 
     pub fn commit_detail(&self, id: &str) -> GitResult<CommitDetail> {
@@ -214,7 +327,7 @@ impl Repo {
             });
         }
         let message = f[8].trim_end().to_string();
-        let commit = Commit {
+        let mut commit = Commit {
             id: f[0].to_string(),
             parents: f[1].split_whitespace().map(str::to_string).collect(),
             author: f[2].to_string(),
@@ -222,7 +335,9 @@ impl Repo {
             time: f[4].parse().unwrap_or(0),
             refs: f[5].split(", ").filter(|s| !s.is_empty()).map(str::to_string).collect(),
             subject: message.lines().next().unwrap_or_default().to_string(),
+            cl: 0,
         };
+        self.assign_cl_numbers(std::slice::from_mut(&mut commit));
         let files = self.commit_files(&commit)?;
         Ok(CommitDetail { committer: f[6].to_string(), commit_time: f[7].parse().unwrap_or(0), commit, message, files })
     }
@@ -243,6 +358,7 @@ mod tests {
 
     fn c(id: &str, parents: &[&str]) -> Commit {
         Commit {
+            cl: 0,
             id: id.into(),
             parents: parents.iter().map(|s| s.to_string()).collect(),
             author: String::new(),
@@ -251,6 +367,40 @@ mod tests {
             refs: vec![],
             subject: String::new(),
         }
+    }
+
+    fn numbered(mut commits: Vec<Commit>, known: &[(&str, u64)]) -> (Vec<u64>, Vec<String>) {
+        let mut known: HashMap<String, u64> = known.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        let missing = number_commits(&mut commits, &mut known);
+        (commits.iter().map(|c| c.cl).collect(), missing)
+    }
+
+    #[test]
+    fn numbers_linear_history_from_the_root() {
+        let (n, missing) = numbered(vec![c("c", &["b"]), c("b", &["a"]), c("a", &[])], &[]);
+        assert_eq!(n, vec![3, 2, 1]);
+        assert!(missing.is_empty());
+        assert_eq!(cl_label(3, "abcdef0123"), "CL #3");
+        assert_eq!(cl_label(0, "abcdef0123"), "abcdef01");
+    }
+
+    #[test]
+    fn merges_and_side_commits_follow_their_first_parent() {
+        // m merges side commit x (off a) into b.
+        let commits = vec![c("m", &["b", "x"]), c("x", &["a"]), c("b", &["a"]), c("a", &[])];
+        let (n, _) = numbered(commits, &[]);
+        assert_eq!(n, vec![3, 2, 2, 1]);
+    }
+
+    #[test]
+    fn reports_gaps_and_uses_known_numbers() {
+        // Window of two commits whose oldest parent isn't loaded.
+        let (n, missing) = numbered(vec![c("d", &["c"]), c("c", &["b"])], &[]);
+        assert_eq!(n, vec![0, 0]);
+        assert_eq!(missing, vec!["b".to_string()]);
+        let (n, missing) = numbered(vec![c("d", &["c"]), c("c", &["b"])], &[("b", 40)]);
+        assert_eq!(n, vec![42, 41]);
+        assert!(missing.is_empty());
     }
 
     #[test]

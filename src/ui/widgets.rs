@@ -55,6 +55,15 @@ impl RowPainter {
         r
     }
 
+    /// Draws text in a fixed-width column as wide as `sample` would be, so what follows lines up across rows.
+    pub fn column(&mut self, s: &str, color: Color32, sample: &str) -> Rect {
+        let width = self.painter.layout_no_wrap(sample.to_string(), self.font.clone(), color).size().x;
+        let start = self.x;
+        let r = self.painter.text(egui::pos2(start, self.rect.center().y), Align2::LEFT_CENTER, s, self.font.clone(), color);
+        self.x = start + width.max(r.width()) + 10.0;
+        r
+    }
+
     pub fn italic(&mut self, s: &str, color: Color32) -> Rect {
         let galley = self.painter.layout_no_wrap(s.to_string(), self.font.clone(), color);
         let pos = egui::pos2(self.x, self.rect.center().y - galley.size().y / 2.0);

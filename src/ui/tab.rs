@@ -59,6 +59,8 @@ pub enum OpOk {
     Sync(SyncOutcome),
     Submitted {
         commit: String,
+        /// Changelist number of what landed on the branch (HEAD after any rebase during upload); 0 if unknown.
+        cl: u64,
         cl_id: u32,
         push: Option<Result<String, String>>,
         unlocked: Vec<String>,
@@ -867,12 +869,12 @@ impl RepoTab {
         match ok {
             OpOk::Message(m) => self.toast(m),
             OpOk::Sync(outcome) => self.on_sync(outcome),
-            OpOk::Submitted { commit, cl_id, push, unlocked, unlock_failed } => {
+            OpOk::Submitted { commit, cl, cl_id, push, unlocked, unlock_failed } => {
                 if cl_id != DEFAULT_ID {
                     self.changelists.delete(cl_id);
                     self.save_changelists();
                 }
-                let short = &commit[..commit.len().min(8)];
+                let short = crate::git::history::cl_label(cl, &commit);
                 match push {
                     None => self.toast(format!("Committed {short} locally. Use Push to upload it to the server.")),
                     Some(Ok(m)) => self.toast(format!("Submitted {short}. {m}")),
@@ -1361,7 +1363,11 @@ impl RepoTab {
                         r.restore_file_from(&rev, &path).map_err(es)?;
                         Ok(OpOk::Message(match backup {
                             Some(_) => format!("Restored {path}. Your previous edits are in the Shelves tab (backups)."),
-                            None => format!("Restored {path} from {}.", &rev[..rev.len().min(8)]),
+                            None => {
+                                let label =
+                                    r.cl_of(&rev).map(|(id, n)| crate::git::history::cl_label(n, &id)).unwrap_or_else(|_| rev.clone());
+                                format!("Restored {path} from {label}.")
+                            }
                         }))
                     })();
                     Msg::Done { title: "Get revision".into(), result: res, net: false }
@@ -1508,7 +1514,9 @@ impl RepoTab {
                             Some(Ok(_)) if !unlock.is_empty() => r.lfs_unlock(&unlock, false),
                             _ => (vec![], vec![]),
                         };
-                        Ok(OpOk::Submitted { commit, cl_id, push: push_res, unlocked, unlock_failed })
+                        // Uploading may have rebased the commit onto newer work, so number what's at HEAD now.
+                        let (commit, cl) = r.cl_of("HEAD").unwrap_or((commit, 0));
+                        Ok(OpOk::Submitted { commit, cl, cl_id, push: push_res, unlocked, unlock_failed })
                     })();
                     Msg::Done { title: "Submit".into(), result: res, net: true }
                 });
@@ -1712,8 +1720,12 @@ fn load_diff(r: &Repo, target: &DiffTarget, file: Option<&FileStatus>, has_head:
                 .flatten()
                 .map(|p| (p, file.old_path.clone().unwrap_or_else(|| file.path.clone())));
             let new = (file.status != 'D').then(|| (Some(id.clone()), file.path.clone()));
-            let what = if matches!(target, DiffTarget::Shelf { .. }) { "shelved" } else { "change" };
-            (format!("{} — {what} {}", file.path, &id[..id.len().min(8)]), d, old, new)
+            let what = if matches!(target, DiffTarget::Shelf { .. }) {
+                "shelved version".to_string()
+            } else {
+                r.cl_of(id).map(|(full, n)| crate::git::history::cl_label(n, &full)).unwrap_or_else(|_| id[..id.len().min(8)].to_string())
+            };
+            (format!("{} — {what}", file.path), d, old, new)
         }
         DiffTarget::Incoming { path } => {
             let d = r.diff_revs(Some("HEAD"), "@{upstream}", path, None).map_err(es)?;

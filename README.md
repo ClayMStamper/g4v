@@ -24,7 +24,7 @@ destructive step is guarded or backed up.
 | Shelve / Unshelve             | **Shelve** any files and optionally **share** them with the team | commit objects under `refs/g4v/shelves/*` (pushable)        |
 | Revert                        | **Revert** (an automatic backup shelf is always made first) | `git restore`                                                    |
 | Resolve                       | **Keep mine / Take theirs / Merge tool / Mark resolved**  | `checkout --ours/--theirs`, with rebase sides already swapped for you |
-| Submitted changelists         | **History** tab with branch graph, details and diffs      | `git log`, `git show`                                              |
+| Submitted changelists         | **History** tab with **CL #** numbers, branch graph, details and diffs | `git log`, `git show`; CL # = first-parent position  |
 | Streams                       | **Branches** panel and toolbar branch picker              | `git switch`, `git merge`                                          |
 | `p4 opened -a`                | **Locks** tab: who has what checked out                   | `git lfs locks --verify`                                           |
 
@@ -59,6 +59,11 @@ remotes, stashes, cherry-pick and "back out this change" (revert commit).
   (*Shelves › Show automatic backups*). Backups are pruned after a configurable retention period (30 days by default).
 * **Image diffs:** PNG/JPG/TGA/TIFF/WebP/BMP/GIF are shown side by side, including files stored in LFS. Other binary
   files show their size change, and text files get a line-numbered diff.
+* **Changelist numbers:** every submitted change gets a Perforce-style **CL #** (CL #1 is the first commit, and each
+  change on a branch is one higher). It's worked out from the history itself, so it's the same for everyone and never
+  changes once uploaded. A change you haven't uploaded yet can get a new number if Get Latest puts it on top of newer
+  work, much like P4V renumbers on submit. Search History by `42`, `#42` or `CL 42`. The Git commit id is still in the
+  tooltip, the right-click menu and the details panel.
 * **History** with a lane graph, branch/tag labels, commit details and per-file diffs. Right-click a change to create a
   branch or tag, back it out, cherry-pick it, or undo your last unpushed commit while keeping its changes. You can also
   restore any older revision of a single file.
