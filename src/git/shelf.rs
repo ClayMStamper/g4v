@@ -105,19 +105,34 @@ impl Repo {
         };
         read_tree.run()?;
 
-        self.git()
-            .env("GIT_INDEX_FILE", &idx_path)
-            .args(["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"])
-            .stdin_paths(paths)
-            .run()?;
+        self.stage_paths(Some(&idx_path), paths)?;
         let tree = self.git().env("GIT_INDEX_FILE", &idx_path).arg("write-tree").run()?.text().trim().to_string();
 
+        self.shelf_from_tree(&tree, head, description)
+    }
+
+    /// Preserve index-only work before staging or reverting replaces it. A shelf of the working copy alone cannot
+    /// recover a version staged in another editor and subsequently edited or deleted on disk.
+    pub(crate) fn backup_staged_paths(&self, paths: &[String]) -> GitResult<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let wanted: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+        let staged = self.git().args(["diff", "--cached", "--name-only", "--no-renames", "-z"]).quiet().run()?;
+        if !super::split_nul(&staged.stdout).iter().any(|p| wanted.contains(p.as_str())) {
+            return Ok(());
+        }
+        let tree = self.run(&["write-tree"])?;
+        let head = self.run(&["rev-parse", "--verify", "--quiet", "HEAD"]).ok();
+        self.shelf_from_tree(&tree, head, &format!("{BACKUP_TAG}staged versions before replacing the index"))?;
+        Ok(())
+    }
+
+    fn shelf_from_tree(&self, tree: &str, head: Option<String>, description: &str) -> GitResult<Shelf> {
         let user = self.config_get("user.name").unwrap_or_else(|| "user".into());
-        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S-%3f").to_string();
-        let name = format!("{}/{}", slug(&user), stamp);
         let message = if description.trim().is_empty() { "Shelved changes".to_string() } else { description.trim().to_string() };
 
-        let mut ct = self.git().arg("commit-tree").arg(&tree);
+        let mut ct = self.git().arg("commit-tree").arg(tree);
         if let Some(h) = &head {
             ct = ct.arg("-p").arg(h);
         }
@@ -125,8 +140,22 @@ impl Repo {
             ct = ct.env(k, v);
         }
         let id = ct.args(["-F", "-"]).stdin(message.clone().into_bytes()).run()?.text().trim().to_string();
-        let refname = format!("{LOCAL_PREFIX}{name}");
-        self.git().args(["update-ref", "-m", "g4v: shelve"]).arg(&refname).arg(&id).run()?;
+        // The name is a timestamp. Passing an empty "old value" makes git refuse to replace an existing ref, so two
+        // shelves made in the same instant can never overwrite each other.
+        let mut attempt = 0;
+        let (name, refname) = loop {
+            let mut stamp = chrono::Local::now().format("%Y%m%d-%H%M%S-%3f").to_string();
+            if attempt > 0 {
+                stamp.push_str(&format!("-{attempt}"));
+            }
+            let name = format!("{}/{}", slug(&user), stamp);
+            let refname = format!("{LOCAL_PREFIX}{name}");
+            match self.git().args(["update-ref", "-m", "g4v: shelve"]).arg(&refname).arg(&id).arg("").run() {
+                Ok(_) => break (name, refname),
+                Err(e) if attempt >= 20 => return Err(e),
+                Err(_) => attempt += 1,
+            }
+        };
         Ok(Shelf {
             refname,
             name,
@@ -182,13 +211,14 @@ impl Repo {
             });
         }
         // Mark local shelves that are mirrored on a remote, and hide the duplicate remote entry.
-        let remote_copies: Vec<(String, String)> =
+        let remote_copies: std::collections::HashSet<(String, String)> =
             shelves.iter().filter(|s| s.remote.is_some()).map(|s| (s.name.clone(), s.id.clone())).collect();
         for s in shelves.iter_mut().filter(|s| s.remote.is_none()) {
-            s.shared = remote_copies.iter().any(|(n, id)| *n == s.name && *id == s.id);
+            s.shared = remote_copies.contains(&(s.name.clone(), s.id.clone()));
         }
-        let local_names: Vec<String> = shelves.iter().filter(|s| s.remote.is_none()).map(|s| s.name.clone()).collect();
-        shelves.retain(|s| s.remote.is_none() || !local_names.contains(&s.name));
+        let local_copies: std::collections::HashSet<(String, String)> =
+            shelves.iter().filter(|s| s.remote.is_none()).map(|s| (s.name.clone(), s.id.clone())).collect();
+        shelves.retain(|s| s.remote.is_none() || !local_copies.contains(&(s.name.clone(), s.id.clone())));
         shelves.sort_by(|a, b| b.time.cmp(&a.time).then(b.name.cmp(&a.name)));
         Ok(shelves)
     }
@@ -208,7 +238,8 @@ impl Repo {
     /// Callers should back up overlapping local edits first.
     pub fn unshelve(&self, shelf: &Shelf, only: Option<&[String]>) -> GitResult<Vec<String>> {
         let files = self.shelf_files(shelf)?;
-        let selected: Vec<&ChangedFile> = files.iter().filter(|f| only.is_none_or(|o| o.contains(&f.path))).collect();
+        let only: Option<std::collections::HashSet<&str>> = only.map(|o| o.iter().map(String::as_str).collect());
+        let selected: Vec<&ChangedFile> = files.iter().filter(|f| only.as_ref().is_none_or(|o| o.contains(f.path.as_str()))).collect();
         let restore: Vec<String> = selected.iter().filter(|f| f.status != 'D').map(|f| f.path.clone()).collect();
         let delete: Vec<String> = selected.iter().filter(|f| f.status == 'D').map(|f| f.path.clone()).collect();
         if !restore.is_empty() {
@@ -219,8 +250,8 @@ impl Repo {
                 .run()?;
         }
         for p in &delete {
-            let abs = self.abs(p);
-            if abs.is_file() {
+            let abs = self.deletion_path(p)?;
+            if abs.is_file() || abs.is_symlink() {
                 std::fs::remove_file(&abs).map_err(|e| GitError {
                     command: format!("delete {p}"),
                     code: None,
@@ -235,7 +266,7 @@ impl Repo {
     }
 
     pub fn delete_shelf(&self, shelf: &Shelf) -> GitResult<()> {
-        self.git().args(["update-ref", "-d"]).arg(&shelf.refname).run()?;
+        self.git().args(["update-ref", "-d"]).arg(&shelf.refname).arg(&shelf.id).run()?;
         Ok(())
     }
 
@@ -267,7 +298,10 @@ impl Repo {
 
     /// Deletes automatic backup shelves older than `days`.
     pub fn prune_backups(&self, days: i64) -> GitResult<usize> {
-        let cutoff = chrono::Local::now().timestamp() - days * 86_400;
+        if days <= 0 {
+            return Ok(0);
+        }
+        let cutoff = chrono::Local::now().timestamp().saturating_sub(days.saturating_mul(86_400));
         let mut n = 0;
         for s in self.list_shelves()? {
             if s.remote.is_none() && s.is_backup() && s.time < cutoff && !s.shared {

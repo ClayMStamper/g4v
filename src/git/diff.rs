@@ -54,6 +54,15 @@ pub struct FileDiff {
 }
 
 const MAX_LINES: usize = 20_000;
+/// How much of a brand-new file is read to preview it.
+const MAX_NEW_FILE_PREVIEW: u64 = 4 * 1024 * 1024;
+const MAX_DIFF_BYTES: usize = 4 * 1024 * 1024;
+
+fn bounded_diff(out: super::GitOutput) -> FileDiff {
+    let mut diff = parse_unified(&String::from_utf8_lossy(&out.stdout[..out.stdout.len().min(MAX_DIFF_BYTES)]));
+    diff.truncated |= out.stdout.len() > MAX_DIFF_BYTES;
+    diff
+}
 
 /// Parses unified diff output for a single file.
 pub fn parse_unified(text: &str) -> FileDiff {
@@ -164,15 +173,24 @@ impl Repo {
     /// Diff of a working file against HEAD (staged + unstaged changes together).
     pub fn diff_worktree(&self, path: &str, orig: Option<&str>, untracked: bool, has_head: bool) -> GitResult<FileDiff> {
         if untracked {
-            let bytes = std::fs::read(self.abs(path)).unwrap_or_default();
-            return Ok(added_file_diff(&bytes));
+            // Only the beginning is read: a new file can be a multi-gigabyte video or cache.
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            let mut whole = true;
+            if let Ok(f) = std::fs::File::open(self.abs(path)) {
+                whole = f.metadata().map(|m| m.len() <= MAX_NEW_FILE_PREVIEW).unwrap_or(true);
+                let _ = f.take(MAX_NEW_FILE_PREVIEW).read_to_end(&mut bytes);
+            }
+            let mut d = added_file_diff(&bytes);
+            d.truncated |= !whole && !d.binary;
+            return Ok(d);
         }
         let base = if has_head { "HEAD" } else { EMPTY_TREE };
         let mut cmd = self.git().args(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M", base, "--"]).arg(path);
         if let Some(o) = orig {
             cmd = cmd.arg(o);
         }
-        Ok(parse_unified(&cmd.quiet().run()?.text()))
+        Ok(bounded_diff(cmd.stdout_limit(MAX_DIFF_BYTES).quiet().run()?))
     }
 
     /// Diff of a file between two revisions (`old` may be None for root commits).
@@ -182,7 +200,13 @@ impl Repo {
         if let Some(o) = old_path {
             cmd = cmd.arg(o);
         }
-        Ok(parse_unified(&cmd.quiet().run()?.text()))
+        Ok(bounded_diff(cmd.stdout_limit(MAX_DIFF_BYTES).quiet().run()?))
+    }
+
+    /// Size in bytes of a file as stored at a revision (for LFS files this is the small pointer; use the pointer's
+    /// own size field for the real size).
+    pub fn blob_size(&self, rev: &str, path: &str) -> Option<u64> {
+        self.git().args(["cat-file", "-s"]).arg(format!("{rev}:{path}")).quiet().run().ok()?.text().trim().parse().ok()
     }
 
     /// File contents at a revision with filters applied (LFS objects are smudged).

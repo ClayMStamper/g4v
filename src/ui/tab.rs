@@ -13,8 +13,10 @@ use crate::git::{GitError, Repo};
 use crate::settings::Settings;
 use crate::worker::Worker;
 use eframe::egui;
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::rc::Rc;
+use std::time::{Duration, Instant, SystemTime};
 
 fn es(e: GitError) -> String {
     e.to_string()
@@ -111,7 +113,8 @@ pub enum OpOk {
 }
 
 pub enum Msg {
-    Status(Result<StatusSnapshot, String>),
+    /// The snapshot and how long git took to produce it (paces the background polling).
+    Status(Result<StatusSnapshot, String>, Duration),
     Tree(Result<TreeData, String>),
     Fetched(Result<FetchData, String>),
     /// Local-only recomputation of incoming files (errors are not network errors).
@@ -211,6 +214,7 @@ pub enum Action {
     OpenSubmodule(String),
     UpdateSubmodules,
     RemoveIndexLock,
+    DoRemoveIndexLock,
     SetupIdentity,
     AddRemote,
     TrackLfs(String),
@@ -240,6 +244,8 @@ pub struct SubmitDlg {
     pub files: Vec<(String, bool)>,
     pub push: bool,
     pub unlock: bool,
+    /// Sizes of the files over the "large file" limit, measured once when the dialog opens.
+    pub large: HashMap<String, u64>,
 }
 
 pub struct ShelveDlg {
@@ -277,7 +283,32 @@ pub struct Toast {
     pub created: Instant,
 }
 
+/// The Pending view's files, grouped by changelist. Rebuilt only when the status, the locks or the changelists
+/// change, so drawing a frame costs the same with ten pending files or ten thousand.
+#[derive(Default)]
+pub struct PendingIndex {
+    /// Every pending path, sorted.
+    pub all: Vec<String>,
+    by_cl: HashMap<u32, Rc<Vec<String>>>,
+    /// How many files of each changelist have local changes (the rest are only checked out).
+    changed: HashMap<u32, usize>,
+    /// All files in display order (Default first, then each changelist), for shift-click ranges.
+    pub order: Rc<Vec<String>>,
+}
+
+impl PendingIndex {
+    pub fn files(&self, id: u32) -> Rc<Vec<String>> {
+        self.by_cl.get(&id).cloned().unwrap_or_default()
+    }
+
+    pub fn changed_in(&self, id: u32) -> usize {
+        self.changed.get(&id).copied().unwrap_or(0)
+    }
+}
+
 // ---------------------------------------------------------------- tab state
+
+type PendingCache = ((u64, u64, u64), Rc<PendingIndex>);
 
 pub struct RepoTab {
     pub repo: Repo,
@@ -291,6 +322,12 @@ pub struct RepoTab {
     pub status_err: Option<String>,
     status_inflight: bool,
     last_status: Instant,
+    /// How long the last `git status` took; huge workspaces are polled less often.
+    status_cost: Duration,
+    /// Bumped whenever a new status / lock list arrives (cache keys).
+    status_gen: u64,
+    locks_gen: u64,
+    pending_cache: RefCell<Option<PendingCache>>,
     pub status_by_path: HashMap<String, usize>,
     pub changed_dirs: HashSet<String>,
 
@@ -298,6 +335,10 @@ pub struct RepoTab {
 
     pub tree: FileTree,
     pub tracked: Vec<String>,
+    tree_known: bool,
+    tracked_set: HashSet<String>,
+    /// Changed files that aren't tracked yet but are shown in the tree.
+    tree_extra: HashSet<String>,
     pub lockable: HashSet<String>,
     pub lfs_paths: HashSet<String>,
     pub uses_lfs: bool,
@@ -314,6 +355,8 @@ pub struct RepoTab {
     pub locks: Vec<Lock>,
     pub locks_by_path: HashMap<String, usize>,
     pub locks_err: Option<String>,
+    /// The lock list has been read from the server at least once.
+    locks_known: bool,
     pub locked_dirs: HashSet<String>,
 
     pub history: Vec<Commit>,
@@ -328,11 +371,11 @@ pub struct RepoTab {
     pub history_loading: bool,
     pub history_err: Option<String>,
     pub selected_commit: Option<String>,
-    pub commit_detail: Option<CommitDetail>,
+    pub commit_detail: Option<Rc<CommitDetail>>,
 
     pub shelves: Vec<Shelf>,
     pub selected_shelf: Option<String>,
-    pub shelf_files: HashMap<String, Vec<ChangedFile>>,
+    pub shelf_files: HashMap<String, Rc<Vec<ChangedFile>>>,
     pub show_backups: bool,
 
     pub refs: Option<RefsData>,
@@ -345,6 +388,10 @@ pub struct RepoTab {
     pub diff: Option<Result<DiffData, String>>,
     pub diff_gen: u64,
     pub diff_loading: bool,
+    /// Modification time and size of the working file whose diff is shown (to notice when it is saved again).
+    diff_stamp: Option<(SystemTime, u64)>,
+    /// The description typed into the last Submit dialog that didn't end in a commit: (changelist, text).
+    pub submit_draft: Option<(u32, String)>,
     pub textures: (Option<egui::TextureHandle>, Option<egui::TextureHandle>),
     /// New diff data arrived; images must be (re-)uploaded.
     pub textures_stale: bool,
@@ -383,11 +430,18 @@ impl RepoTab {
             status_err: None,
             status_inflight: false,
             last_status: Instant::now(),
+            status_cost: Duration::ZERO,
+            status_gen: 0,
+            locks_gen: 0,
+            pending_cache: RefCell::new(None),
             status_by_path: HashMap::new(),
             changed_dirs: HashSet::new(),
             changelists,
             tree: FileTree::default(),
             tracked: Vec::new(),
+            tree_known: false,
+            tracked_set: HashSet::new(),
+            tree_extra: HashSet::new(),
             lockable: HashSet::new(),
             lfs_paths: HashSet::new(),
             uses_lfs: repo.uses_lfs(),
@@ -401,6 +455,7 @@ impl RepoTab {
             locks: Vec::new(),
             locks_by_path: HashMap::new(),
             locks_err: None,
+            locks_known: false,
             locked_dirs: HashSet::new(),
             history: Vec::new(),
             graph: Vec::new(),
@@ -426,6 +481,8 @@ impl RepoTab {
             diff: None,
             diff_gen: 0,
             diff_loading: false,
+            diff_stamp: None,
+            submit_draft: None,
             textures: (None, None),
             textures_stale: true,
             dialog: None,
@@ -437,6 +494,9 @@ impl RepoTab {
             remote: repo.default_remote(),
             repo,
         };
+        if let Some(e) = tab.changelists.load_error.clone() {
+            tab.error(e);
+        }
         tab.refresh_all();
         tab.request_fetch();
         tab
@@ -450,6 +510,7 @@ impl RepoTab {
         self.diff = None;
         self.diff_gen += 1;
         self.diff_loading = false;
+        self.diff_stamp = None;
         self.textures = (None, None);
         self.textures_stale = true;
     }
@@ -472,6 +533,10 @@ impl RepoTab {
 
     pub fn net_busy(&self) -> bool {
         self.net.busy()
+    }
+
+    pub fn has_pending_work(&self) -> bool {
+        self.local.busy()
     }
 
     pub fn files(&self) -> &[FileStatus] {
@@ -499,22 +564,46 @@ impl RepoTab {
         self.status.as_ref().is_some_and(|s| s.has_conflicts())
     }
 
-    /// Paths shown in the Pending view: changed files plus files I have locked.
-    pub fn pending_paths(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.files().iter().filter(|f| f.kind != ChangeKind::Conflict).map(|f| f.path.clone()).collect();
-        for l in self.locks.iter().filter(|l| l.ours) {
-            if !self.status_by_path.contains_key(&l.path) {
-                v.push(l.path.clone());
+    /// What the Pending view shows: changed files plus files I have locked, grouped by changelist.
+    pub fn pending(&self) -> Rc<PendingIndex> {
+        let key = (self.status_gen, self.locks_gen, self.changelists.rev());
+        if let Some((k, idx)) = self.pending_cache.borrow().as_ref() {
+            if *k == key {
+                return idx.clone();
             }
         }
-        v.sort();
-        v.dedup();
-        v
+        let mut all: Vec<String> = self.files().iter().filter(|f| f.kind != ChangeKind::Conflict).map(|f| f.path.clone()).collect();
+        for l in self.locks.iter().filter(|l| l.ours) {
+            if !self.status_by_path.contains_key(&l.path) {
+                all.push(l.path.clone());
+            }
+        }
+        all.sort();
+        all.dedup();
+        let grouped = self.changelists.group(&all);
+        let mut order = Vec::with_capacity(all.len());
+        let mut by_cl = HashMap::new();
+        let mut changed = HashMap::new();
+        for id in std::iter::once(DEFAULT_ID).chain(self.changelists.lists.iter().map(|c| c.id)) {
+            if let Some(files) = grouped.get(&id) {
+                order.extend(files.iter().cloned());
+                changed.insert(id, files.iter().filter(|p| self.status_by_path.contains_key(*p)).count());
+                by_cl.insert(id, Rc::new(files.clone()));
+            }
+        }
+        let idx = Rc::new(PendingIndex { all, by_cl, changed, order: Rc::new(order) });
+        *self.pending_cache.borrow_mut() = Some((key, idx.clone()));
+        idx
+    }
+
+    /// Paths shown in the Pending view: changed files plus files I have locked.
+    pub fn pending_paths(&self) -> Vec<String> {
+        self.pending().all.clone()
     }
 
     /// Paths in changelist `id`.
-    pub fn cl_files(&self, id: u32) -> Vec<String> {
-        self.changelists.files_in(id, &self.pending_paths())
+    pub fn cl_files(&self, id: u32) -> Rc<Vec<String>> {
+        self.pending().files(id)
     }
 
     pub fn changelist_name(&self, id: u32) -> String {
@@ -545,6 +634,8 @@ impl RepoTab {
             .collect()
     }
 
+    /// Files over the size limit that aren't stored with LFS. This touches the disk once per file, so call it when
+    /// a dialog opens, not on every frame.
     pub fn large_non_lfs(&self, paths: &[String], threshold_mb: u64) -> Vec<(String, u64)> {
         let limit = threshold_mb.saturating_mul(1024 * 1024);
         paths
@@ -553,6 +644,12 @@ impl RepoTab {
             .filter(|p| self.file(p).is_some_and(|f| matches!(f.kind, ChangeKind::Add | ChangeKind::Edit | ChangeKind::Move)))
             .filter_map(|p| self.repo.file_size(p).filter(|s| *s >= limit).map(|s| (p.clone(), s)))
             .collect()
+    }
+
+    /// (modification time, size) of a working file.
+    fn working_stamp(&self, path: &str) -> Option<(SystemTime, u64)> {
+        let m = std::fs::metadata(self.repo.abs(path)).ok()?;
+        Some((m.modified().ok()?, m.len()))
     }
 
     // ------------------------------------------------------------ requests
@@ -573,7 +670,11 @@ impl RepoTab {
         }
         self.status_inflight = true;
         self.last_status = Instant::now();
-        self.local.submit("status", |r| Msg::Status(r.status().map_err(es)));
+        self.local.submit("status", |r| {
+            let started = Instant::now();
+            let res = r.status().map_err(es);
+            Msg::Status(res, started.elapsed())
+        });
     }
 
     fn request_tree(&mut self) {
@@ -584,12 +685,14 @@ impl RepoTab {
         self.local.submit("Reading files", |r| {
             Msg::Tree((|| {
                 let tracked = r.tracked_files().map_err(es)?;
-                let uses_lfs = r.uses_lfs();
-                let (lockable, lfs) = if uses_lfs {
-                    (r.lockable_paths(&tracked).unwrap_or_default(), r.lfs_tracked_paths(&tracked).unwrap_or_default())
-                } else {
-                    Default::default()
-                };
+                // Attributes can come from nested folders or .git/info/attributes, not just the root file.
+                let mut candidates = tracked.clone();
+                candidates.extend(r.status().map_err(es)?.files.into_iter().map(|f| f.path));
+                candidates.sort();
+                candidates.dedup();
+                let lockable = r.lockable_paths(&candidates).map_err(es)?;
+                let lfs = r.lfs_tracked_paths(&candidates).map_err(es)?;
+                let uses_lfs = r.uses_lfs() || !lockable.is_empty() || !lfs.is_empty();
                 let lfs_installed = !uses_lfs || r.lfs_installed();
                 Ok(TreeData { tracked, lockable, lfs, uses_lfs, lfs_installed })
             })())
@@ -655,6 +758,10 @@ impl RepoTab {
     pub fn request_diff(&mut self, target: DiffTarget) {
         self.diff_gen += 1;
         let gen = self.diff_gen;
+        self.diff_stamp = match &target {
+            DiffTarget::Working { path } => self.working_stamp(path),
+            _ => None,
+        };
         self.diff_target = Some(target.clone());
         self.diff_loading = true;
         let has_head = self.status.as_ref().is_some_and(|s| s.branch.oid.is_some());
@@ -671,9 +778,24 @@ impl RepoTab {
         for msg in self.local.poll().into_iter().chain(self.net.poll()) {
             self.handle_msg(msg, settings);
         }
+        for error in self.local.poll_errors().into_iter().chain(self.net.poll_errors()) {
+            self.error(error);
+            self.status_inflight = false;
+            self.fetch_inflight = false;
+            self.diff_loading = false;
+            self.history_loading = false;
+            self.tree_stale = true;
+        }
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-        // Poll the working copy for changes made by other programs (Photoshop, Blender, ...).
-        let interval = if focused { Duration::from_secs(2) } else { Duration::from_secs(10) };
+        if self.status_inflight && !self.local.busy() {
+            // The status job is gone without an answer (it can only have crashed); don't wait for it forever.
+            self.status_inflight = false;
+        }
+        // Poll the working copy for changes made by other programs (Photoshop, Blender, ...). In a huge workspace a
+        // scan takes a while, so leave at least five times its duration between scans: polling never uses more than
+        // a sixth of a core and never queues up in front of what the artist asks for.
+        let base = if focused { Duration::from_secs(2) } else { Duration::from_secs(10) };
+        let interval = base.max(self.status_cost * 5).min(Duration::from_secs(60));
         if self.last_status.elapsed() >= interval && !self.local.busy() {
             self.request_status(false);
         }
@@ -692,8 +814,11 @@ impl RepoTab {
 
     fn handle_msg(&mut self, msg: Msg, settings: &Settings) {
         match msg {
-            Msg::Status(res) => {
+            Msg::Status(res, cost) => {
                 self.status_inflight = false;
+                self.status_cost = cost;
+                // Measure the pause from when the scan finished, not from when it was asked for.
+                self.last_status = Instant::now();
                 match res {
                     Ok(s) => self.apply_status(s),
                     Err(e) => self.status_err = Some(e),
@@ -701,12 +826,19 @@ impl RepoTab {
             }
             Msg::Tree(res) => match res {
                 Ok(t) => {
+                    let newly_uses_lfs = t.uses_lfs && !self.uses_lfs;
+                    self.tree_known = true;
+                    self.tracked_set = t.tracked.iter().cloned().collect();
                     self.tracked = t.tracked;
                     self.lockable = t.lockable;
                     self.lfs_paths = t.lfs;
                     self.uses_lfs = t.uses_lfs;
                     self.lfs_installed = t.lfs_installed;
+                    if newly_uses_lfs {
+                        self.request_locks();
+                    }
                     self.rebuild_tree();
+                    self.prune_changelists();
                 }
                 Err(e) => self.error(format!("Could not list files: {e}")),
             },
@@ -744,14 +876,22 @@ impl RepoTab {
                 }
             }
             Msg::Locks(res) => match res {
-                Ok(l) => {
+                Ok(mut l) => {
+                    // Mine first, then by path: the order the Locks tab shows.
+                    l.sort_by(|a, b| b.ours.cmp(&a.ours).then(a.path.cmp(&b.path)));
                     self.locks = l;
+                    self.locks_gen += 1;
+                    self.locks_known = true;
                     self.locks_by_path = self.locks.iter().enumerate().map(|(i, l)| (l.path.clone(), i)).collect();
                     self.locked_dirs = ancestor_dirs(self.locks.iter().map(|l| &l.path));
                     self.locks_err = None;
                     self.tree.mark_dirty();
+                    self.prune_changelists();
                 }
-                Err(e) => self.locks_err = Some(e),
+                Err(e) => {
+                    self.locks_known = false;
+                    self.locks_err = Some(e);
+                }
             },
             Msg::History(gen, res) => {
                 if gen == self.history_gen {
@@ -769,7 +909,7 @@ impl RepoTab {
             Msg::CommitDetail(res) => match res {
                 Ok(d) => {
                     if self.selected_commit.as_deref() == Some(d.commit.id.as_str()) {
-                        self.commit_detail = Some(d);
+                        self.commit_detail = Some(Rc::new(d));
                     }
                 }
                 Err(e) => self.error(e),
@@ -794,7 +934,7 @@ impl RepoTab {
             },
             Msg::ShelfFiles(id, res) => match res {
                 Ok(f) => {
-                    self.shelf_files.insert(id, f);
+                    self.shelf_files.insert(id, Rc::new(f));
                 }
                 Err(e) => self.error(e),
             },
@@ -821,29 +961,40 @@ impl RepoTab {
     fn apply_status(&mut self, s: StatusSnapshot) {
         let files_changed = self.status.as_ref().map(|o| o.files != s.files).unwrap_or(true);
         let head_changed = self.status.as_ref().map(|o| o.branch != s.branch).unwrap_or(true);
-        self.status_by_path = s.files.iter().enumerate().map(|(i, f)| (f.path.clone(), i)).collect();
-        self.changed_dirs = ancestor_dirs(s.files.iter().map(|f| &f.path));
+        let shown = match &self.diff_target {
+            Some(DiffTarget::Working { path }) => Some((path.clone(), self.file(path).cloned())),
+            _ => None,
+        };
+        if files_changed {
+            self.status_by_path = s.files.iter().enumerate().map(|(i, f)| (f.path.clone(), i)).collect();
+            self.changed_dirs = ancestor_dirs(s.files.iter().map(|f| &f.path));
+        }
         self.status = Some(s);
+        self.status_gen += 1;
         self.status_err = None;
         if files_changed {
-            // Forget changelist entries for files that are no longer pending.
-            let live: HashSet<String> = self.pending_paths().into_iter().collect();
-            if self.changelists.prune(&live) {
-                self.save_changelists();
-            }
-            self.selection.retain(|p| live.contains(p));
-            let untracked_added = self.files().iter().any(|f| f.untracked && !self.tracked.contains(&f.path));
-            if untracked_added || self.tree.nodes.is_empty() {
+            self.prune_changelists();
+            // Unchanged files stay selected too (they may be about to be checked out).
+            let mut live: HashSet<String> = self.pending().all.iter().cloned().collect();
+            live.extend(self.locks.iter().map(|l| l.path.clone()));
+            let tracked = &self.tracked_set;
+            self.selection.retain(|p| live.contains(p) || tracked.contains(p));
+            let extra: HashSet<String> = self.files().iter().filter(|f| !tracked.contains(&f.path)).map(|f| f.path.clone()).collect();
+            if extra != self.tree_extra || self.tree.nodes.is_empty() {
                 self.rebuild_tree();
             } else {
                 self.tree.mark_dirty();
             }
-            // Keep the diff of the selected working file current.
-            if let Some(DiffTarget::Working { path }) = self.diff_target.clone() {
-                if self.status_by_path.contains_key(&path) {
-                    self.request_diff(DiffTarget::Working { path });
-                } else {
-                    self.clear_diff();
+        }
+        // Keep the diff of the selected working file current: reload it when its status changes or it is saved
+        // again, but not every time some other file in the workspace changes.
+        if let Some((path, before)) = shown {
+            match self.file(&path).cloned() {
+                None => self.clear_diff(),
+                now => {
+                    if now != before || self.working_stamp(&path) != self.diff_stamp {
+                        self.request_diff(DiffTarget::Working { path });
+                    }
                 }
             }
         }
@@ -854,14 +1005,37 @@ impl RepoTab {
         }
     }
 
-    fn rebuild_tree(&mut self) {
-        let tracked: HashSet<&String> = self.tracked.iter().collect();
-        let mut files: Vec<String> = self.tracked.clone();
-        for f in self.files() {
-            if !tracked.contains(&f.path) {
-                files.push(f.path.clone());
-            }
+    /// Forgets changelist entries for files that are no longer pending.
+    ///
+    /// Deliberately cautious, because a wrongly dropped entry silently moves a file to the Default changelist:
+    /// * not while a merge or rebase is under way (git sets uncommitted work aside until it finishes),
+    /// * not before the first status and file list have arrived,
+    /// * and until the server has told us which files I have checked out, entries for lockable files are kept: they
+    ///   may be "checked out, unchanged" files that haven't shown up yet (or can't, when working offline).
+    fn prune_changelists(&mut self) {
+        let Some(st) = &self.status else { return };
+        if !self.tree_known || st.op != RepoOp::None || st.index_lock || self.changelists.lists.iter().all(|l| l.files.is_empty()) {
+            return;
         }
+        let locks_pending = self.uses_lfs && !self.locks_known;
+        if locks_pending && self.tracked.is_empty() {
+            return;
+        }
+        let mut keep: HashSet<String> = self.pending().all.iter().cloned().collect();
+        if locks_pending {
+            let entries = self.changelists.lists.iter().flat_map(|l| l.files.iter());
+            keep.extend(entries.filter(|f| self.lockable.contains(*f) || self.lfs_paths.contains(*f)).cloned());
+        }
+        if self.changelists.prune(&keep) {
+            self.save_changelists();
+        }
+    }
+
+    fn rebuild_tree(&mut self) {
+        let extra: HashSet<String> = self.files().iter().filter(|f| !self.tracked_set.contains(&f.path)).map(|f| f.path.clone()).collect();
+        let mut files: Vec<String> = self.tracked.clone();
+        files.extend(self.files().iter().filter(|f| extra.contains(&f.path)).map(|f| f.path.clone()));
+        self.tree_extra = extra;
         let have: HashSet<String> = files.iter().cloned().collect();
         let ghosts: Vec<String> = self.incoming.iter().filter(|(p, c)| **c != 'D' && !have.contains(*p)).map(|(p, _)| p.clone()).collect();
         self.tree.rebuild(&files, &ghosts);
@@ -888,7 +1062,10 @@ impl RepoTab {
         let ok = match result {
             Ok(ok) => ok,
             Err(e) => {
-                self.error(format!("{title} failed:\n{e}"));
+                match hint_for(&e) {
+                    Some(hint) => self.error(format!("{title} failed. {hint}\n\nDetails:\n{e}")),
+                    None => self.error(format!("{title} failed:\n{e}")),
+                }
                 return;
             }
         };
@@ -896,6 +1073,8 @@ impl RepoTab {
             OpOk::Message(m) => self.toast(m),
             OpOk::Sync(outcome) => self.on_sync(outcome),
             OpOk::Submitted { commit, cl, cl_id, push, unlocked, unlock_failed } => {
+                // The change is committed, so the typed description is no longer needed.
+                self.submit_draft = None;
                 if cl_id != DEFAULT_ID {
                     self.changelists.delete(cl_id);
                     self.save_changelists();
@@ -904,15 +1083,18 @@ impl RepoTab {
                 match push {
                     None => self.toast(format!("Committed {short} locally. Use Push to upload it to the server.")),
                     Some(Ok(m)) => self.toast(format!("Submitted {short}. {m}")),
-                    Some(Err(e)) => self.error(format!(
-                        "Your change was committed locally ({short}) but could not be uploaded:\n{e}\n\nNothing is lost. Press Push to try again."
-                    )),
+                    Some(Err(e)) => {
+                        let hint = hint_for(&e).map(|h| format!("{h}\n\n")).unwrap_or_default();
+                        self.error(format!(
+                            "Your change was committed locally ({short}) but could not be uploaded.\n{hint}Nothing is lost. Press Push to try again.\n\nDetails:\n{e}"
+                        ))
+                    }
                 }
                 if !unlocked.is_empty() {
                     self.toast(format!("Released {} lock(s).", unlocked.len()));
                 }
-                for (p, e) in unlock_failed {
-                    self.error(format!("Could not release lock on {p}: {e}"));
+                if !unlock_failed.is_empty() {
+                    self.error(failure_summary("Could not release the lock on", &unlock_failed));
                 }
             }
             OpOk::Shelved { shelf, reverted, share, cl_id } => {
@@ -952,8 +1134,8 @@ impl RepoTab {
                 if !ok.is_empty() {
                     self.toast(format!("{verb} {} file(s).", ok.len()));
                 }
-                for (p, e) in failed {
-                    self.error(format!("{p}: {e}"));
+                if !failed.is_empty() {
+                    self.error(failure_summary(&format!("{verb}: could not process"), &failed));
                 }
             }
             OpOk::BlockedResolved { shelf, sync } => {
@@ -1004,10 +1186,10 @@ impl RepoTab {
             }
             Action::ShelveOverlapAndSync(paths) => {
                 let mode = settings.pull_mode;
-                let files: Vec<FileStatus> = self.files().iter().filter(|f| paths.contains(&f.path)).cloned().collect();
                 let branch = self.branch_name();
                 self.local.submit("Shelving and getting latest", move |r| {
                     let res = (|| {
+                        let files = fresh_statuses(r, &paths)?;
                         let mut all = paths.clone();
                         all.extend(files.iter().filter_map(|f| f.orig_path.clone()));
                         let shelf = r.create_shelf(&all, &format!("My edits set aside to get latest on {branch}")).map_err(es)?;
@@ -1184,7 +1366,7 @@ impl RepoTab {
                 let op = self.op();
                 self.dialog = Some(Dialog::Confirm {
                     title: format!("Abort the {}?", op.label()),
-                    body: "This puts everything back the way it was before you started getting latest / merging. Your own committed and uncommitted work is kept.".into(),
+                    body: "This returns to the state before the operation. Current file edits and conflict-resolution work are backed up in Shelves before aborting.".into(),
                     action: Action::DoAbortOp,
                 });
             }
@@ -1205,10 +1387,11 @@ impl RepoTab {
                 }
             }
             Action::SwitchNow(target, shelve_first) => {
-                let files: Vec<FileStatus> = self.files().iter().filter(|f| !f.submodule).cloned().collect();
-                let from = self.branch_name();
                 self.local.submit("Switching branch", move |r| {
                     let res = (|| {
+                        let status = r.status().map_err(es)?;
+                        let from = status.branch.head.unwrap_or_else(|| "detached".into());
+                        let files: Vec<_> = status.files.into_iter().filter(|f| !f.submodule).collect();
                         if shelve_first && !files.is_empty() {
                             let mut paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
                             paths.extend(files.iter().filter_map(|f| f.orig_path.clone()));
@@ -1373,19 +1556,11 @@ impl RepoTab {
                 });
             }
             Action::DoGetRevision(rev, path) => {
-                let dirty = self.file(&path).is_some();
                 self.local.submit("Getting revision", move |r| {
                     let res = (|| {
-                        let mut backup = None;
-                        if dirty {
-                            backup = Some(
-                                r.create_shelf(
-                                    std::slice::from_ref(&path),
-                                    &format!("{BACKUP_TAG}before getting older revision of {path}"),
-                                )
-                                .map_err(es)?,
-                            );
-                        }
+                        // Looked up here rather than taken from the screen, which can be a moment out of date.
+                        let backup =
+                            backup_local_edits(r, std::slice::from_ref(&path), &format!("before getting older revision of {path}"))?;
                         r.restore_file_from(&rev, &path).map_err(es)?;
                         Ok(OpOk::Message(match backup {
                             Some(_) => format!("Restored {path}. Your previous edits are in the Shelves tab (backups)."),
@@ -1416,7 +1591,8 @@ impl RepoTab {
                     return;
                 };
                 let files = files
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .map(|f| {
                         let on = preselect.is_empty() || preselect.contains(&f.path);
                         (f, on)
@@ -1504,6 +1680,13 @@ impl RepoTab {
                 });
             }
             Action::RemoveIndexLock => {
+                self.dialog = Some(Dialog::Confirm {
+                    title: "Remove Git's lock file?".into(),
+                    body: "Git creates this file while it is working and removes it when it is done. Only remove it if nothing else is using this project right now: no other g4v window, terminal, game engine or sync tool that is still running a Git command. Removing it while one is still working can damage the project's index.\n\nIf you're not sure, wait a minute and press Refresh first.".into(),
+                    action: Action::DoRemoveIndexLock,
+                });
+            }
+            Action::DoRemoveIndexLock => {
                 match self.repo.remove_index_lock() {
                     Ok(()) => self.toast("Removed the stale lock file."),
                     Err(e) => self.error(format!("Could not remove the lock: {e}")),
@@ -1530,10 +1713,29 @@ impl RepoTab {
                     net: false,
                 });
             }
-            Action::DoSubmit { paths, message, cl_id, push, unlock } => {
+            Action::DoSubmit { mut paths, message, cl_id, push, unlock } => {
                 let mode = settings.pull_mode;
+                // A moved file is two changes: the new path appears and the old one disappears. Submit both.
+                let old_paths: Vec<String> = paths.iter().filter_map(|p| self.file(p).and_then(|f| f.orig_path.clone())).collect();
+                paths.extend(old_paths);
                 self.local.submit("Submitting", move |r| {
                     let res = (|| {
+                        // Recheck at execution time: the dialog may have been open while a teammate checked out a file.
+                        let lockable = r.lockable_paths(&paths).map_err(es)?;
+                        if push && !lockable.is_empty() {
+                            let locks = r.lfs_locks().map_err(|e| {
+                                format!(
+                                    "Could not verify file locks: {e}. Reconnect and try again, or untick Upload to save a local commit."
+                                )
+                            })?;
+                            let selected: HashSet<&str> = paths.iter().map(String::as_str).collect();
+                            if let Some(lock) = locks.iter().find(|l| !l.ours && selected.contains(l.path.as_str())) {
+                                return Err(format!(
+                                    "{} is checked out by {}. Untick that file or ask them to release it.",
+                                    lock.path, lock.owner
+                                ));
+                            }
+                        }
                         let commit = r.commit_paths(&paths, &message).map_err(es)?;
                         let push_res = push.then(|| push_with_retry(r, mode));
                         let (unlocked, unlock_failed) = match &push_res {
@@ -1549,10 +1751,10 @@ impl RepoTab {
                 self.selection.clear();
             }
             Action::DoShelve { paths, description, revert, share, cl_id } => {
-                let files: Vec<FileStatus> = self.files().iter().filter(|f| paths.contains(&f.path)).cloned().collect();
                 let remote = self.remote.clone().or_else(|| self.repo.default_remote());
                 self.local.submit("Shelving", move |r| {
                     let res = (|| {
+                        let files = fresh_statuses(r, &paths)?;
                         let mut all = paths.clone();
                         all.extend(files.iter().filter_map(|f| f.orig_path.clone()));
                         let shelf = r.create_shelf(&all, &description).map_err(es)?;
@@ -1572,9 +1774,12 @@ impl RepoTab {
                 // Bring back work shelved when leaving this branch, then drop the shelf.
                 self.local.submit("Restoring your work", move |r| {
                     let res = (|| {
+                        // The shelf replaces whole files, so anything edited since coming back is backed up first.
+                        let shelved: Vec<String> = r.shelf_files(&shelf).map_err(es)?.into_iter().map(|f| f.path).collect();
+                        let backup = backup_local_edits(r, &shelved, "before restoring shelved work")?;
                         let written = r.unshelve(&shelf, None).map_err(es)?;
                         r.delete_shelf(&shelf).map_err(es)?;
-                        Ok(OpOk::Unshelved { paths: written, description: shelf.display_name(), backup: None, new_changelist: false })
+                        Ok(OpOk::Unshelved { paths: written, description: shelf.display_name(), backup, new_changelist: false })
                     })();
                     Msg::Done { title: "Restore".into(), result: res, net: false }
                 });
@@ -1582,16 +1787,7 @@ impl RepoTab {
             Action::DoUnshelve { shelf, paths } => {
                 self.local.submit("Unshelving", move |r| {
                     let res = (|| {
-                        let dirty: Vec<String> =
-                            r.status().map_err(es)?.files.into_iter().filter(|f| paths.contains(&f.path)).map(|f| f.path).collect();
-                        let backup = if dirty.is_empty() {
-                            None
-                        } else {
-                            let b = r
-                                .create_shelf(&dirty, &format!("{BACKUP_TAG}before unshelving \"{}\"", first_line(&shelf.description)))
-                                .map_err(es)?;
-                            Some(b.display_name())
-                        };
+                        let backup = backup_local_edits(r, &paths, &format!("before unshelving \"{}\"", first_line(&shelf.description)))?;
                         let written = r.unshelve(&shelf, Some(&paths)).map_err(es)?;
                         Ok(OpOk::Unshelved { paths: written, description: shelf.display_name(), backup, new_changelist: true })
                     })();
@@ -1599,10 +1795,10 @@ impl RepoTab {
                 });
             }
             Action::DoRevert(paths) => {
-                let files: Vec<FileStatus> = self.files().iter().filter(|f| paths.contains(&f.path)).cloned().collect();
-                let n = files.len();
                 self.local.submit("Reverting", move |r| {
                     let res = (|| {
+                        let files = fresh_statuses(r, &paths)?;
+                        let n = files.len();
                         let mut all: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
                         all.extend(files.iter().filter_map(|f| f.orig_path.clone()));
                         let non_sub: Vec<String> = files.iter().filter(|f| !f.submodule).map(|f| f.path.clone()).collect();
@@ -1652,23 +1848,29 @@ impl RepoTab {
             self.error("Finish resolving the current conflicts first (Pending tab), then press Continue.");
             return;
         }
-        let files: Vec<String> = self.cl_files(cl_id).into_iter().filter(|p| self.file(p).is_some()).collect();
+        let files: Vec<String> = self.cl_files(cl_id).iter().filter(|p| self.file(p).is_some()).cloned().collect();
         if files.is_empty() {
             self.error("This changelist has no changed files to submit.");
             return;
         }
-        let message = if cl_id == DEFAULT_ID {
-            String::new()
-        } else {
-            self.changelists.get(cl_id).map(|c| c.description.clone()).unwrap_or_default()
-        };
+        // A description typed earlier that didn't make it into a commit (cancelled, or the submit failed) comes back.
+        let draft = self.submit_draft.as_ref().filter(|(id, text)| *id == cl_id && !text.trim().is_empty()).map(|(_, t)| t.clone());
+        let message = draft.unwrap_or_else(|| {
+            if cl_id == DEFAULT_ID {
+                String::new()
+            } else {
+                self.changelists.get(cl_id).map(|c| c.description.clone()).unwrap_or_default()
+            }
+        });
         let has_remote = self.remote.is_some();
+        let large = self.large_non_lfs(&files, settings.large_file_mb).into_iter().collect();
         self.dialog = Some(Dialog::Submit(SubmitDlg {
             cl_id,
             message,
             files: files.into_iter().map(|f| (f, true)).collect(),
             push: settings.push_on_submit && has_remote,
             unlock: settings.unlock_after_submit,
+            large,
         }));
     }
 
@@ -1686,6 +1888,107 @@ pub fn wip_description(branch: &str) -> String {
 
 pub fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or_default().trim().to_string()
+}
+
+/// Shelves the local changes to any of `paths` as an automatic backup. Returns the backup's name, if one was needed.
+fn fresh_statuses(r: &Repo, paths: &[String]) -> Result<Vec<FileStatus>, String> {
+    let wanted: HashSet<&str> = paths.iter().map(String::as_str).collect();
+    Ok(r.status().map_err(es)?.files.into_iter().filter(|f| wanted.contains(f.path.as_str())).collect())
+}
+
+fn backup_local_edits(r: &Repo, paths: &[String], why: &str) -> Result<Option<String>, String> {
+    let wanted: HashSet<&str> = paths.iter().map(String::as_str).collect();
+    let mut dirty: Vec<String> = r
+        .status()
+        .map_err(es)?
+        .files
+        .into_iter()
+        .filter(|f| wanted.contains(f.path.as_str()) || f.orig_path.as_deref().is_some_and(|p| wanted.contains(p)))
+        .flat_map(|f| std::iter::once(f.path).chain(f.orig_path))
+        .collect();
+    // Ignored files are invisible to status but can still be overwritten by an older revision or a shelf.
+    if !paths.is_empty() {
+        // check-ignore consumes literal filenames, but rejects Git's global literal-pathspec magic.
+        let ignored = r
+            .git()
+            .args(["check-ignore", "-z", "--stdin"])
+            .env("GIT_LITERAL_PATHSPECS", "0")
+            .stdin_paths(paths)
+            .ok_codes(&[0, 1])
+            .run()
+            .map_err(es)?;
+        dirty.extend(crate::git::split_nul(&ignored.stdout).into_iter().filter(|p| r.abs(p).is_file() || r.abs(p).is_symlink()));
+    }
+    dirty.sort();
+    dirty.dedup();
+    if dirty.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(r.create_shelf(&dirty, &format!("{BACKUP_TAG}{why}")).map_err(es)?.display_name()))
+}
+
+/// One message for a batch of per-file failures (instead of one pop-up per file).
+fn failure_summary(what: &str, failed: &[(String, String)]) -> String {
+    const SHOWN: usize = 5;
+    let mut m = format!("{what} {} file(s):", failed.len());
+    for (p, e) in failed.iter().take(SHOWN) {
+        m.push_str(&format!("\n• {p}: {}", first_line(e)));
+    }
+    if failed.len() > SHOWN {
+        m.push_str(&format!("\n…and {} more (see the Log tab).", failed.len() - SHOWN));
+    }
+    if let Some(h) = failed.first().and_then(|(_, e)| hint_for(e)) {
+        m.push_str(&format!("\n\n{h}"));
+    }
+    m
+}
+
+/// A plain-language explanation for the git errors artists run into most.
+pub fn hint_for(err: &str) -> Option<&'static str> {
+    let e = err.to_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| e.contains(n));
+    if has(&["index.lock"]) {
+        Some("Another Git program is working in this project. Wait for it to finish and try again; if it crashed, g4v will offer to remove its lock file.")
+    } else if has(&[
+        "permission denied",
+        "unable to unlink",
+        "used by another process",
+        "resource busy",
+        "unable to create file",
+        "access is denied",
+    ]) {
+        Some("A file couldn't be changed, most likely because it is open in another program (Photoshop, Maya, Unreal…). Close it there and try again.")
+    } else if has(&["no space left", "not enough space", "disk full", "disk quota"]) {
+        Some("The disk is full. Free up some space, refresh the project, and check the operation's result before trying again. Automatic backups are in Shelves.")
+    } else if has(&["filename too long", "file name too long"]) {
+        Some("A file's folder path is too long for this computer. Move the project closer to the drive root (for example D:\\proj) or shorten the folder names.")
+    } else if has(&[
+        "authentication failed",
+        "could not read username",
+        "could not read password",
+        "terminal prompts disabled",
+        "http 401",
+        "403",
+    ]) {
+        Some("The server didn't accept your sign-in. Sign in again when the login window appears, or ask your admin to check your access.")
+    } else if has(&[
+        "could not resolve host",
+        "unable to access",
+        "timed out",
+        "connection refused",
+        "network is unreachable",
+        "could not read from remote",
+    ]) {
+        Some("The server can't be reached. Check your internet or VPN connection; your work is safe on this computer in the meantime.")
+    } else if has(&["exceeds github's file size limit", "gh001", "file size limit", "large files detected"]) {
+        Some("The server refuses files this large. Store that file type with Git LFS (right-click the file) and submit again.")
+    } else if has(&["locked by", "cannot update locked files", "lock exists", "already locked"]) {
+        Some("Someone else has the file checked out. See the Locks tab for who, and ask them to release it.")
+    } else if has(&["lfs: ", "batch response", "smudge filter lfs failed", "git-lfs"]) {
+        Some("Git LFS (the large-file storage) reported a problem. Check that you're online and signed in, then try again.")
+    } else {
+        None
+    }
 }
 
 /// Push; if the server has newer commits, get latest and push again once.
@@ -1713,9 +2016,18 @@ fn push_with_retry(r: &Repo, mode: PullMode) -> Result<String, String> {
 }
 
 const MAX_IMAGE_SIDE: u32 = 2048;
+/// Images larger than this are described by size only instead of being decoded for a preview.
+const MAX_PREVIEW_BYTES: u64 = 256 * 1024 * 1024;
 
 fn decode_image(bytes: &[u8]) -> Option<egui::ColorImage> {
-    let img = image::load_from_memory(bytes).ok()?;
+    // Compressed size is not a bound on decoded memory (e.g. a huge single-colour TIFF).
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_PREVIEW_BYTES);
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
     let img =
         if img.width() > MAX_IMAGE_SIDE || img.height() > MAX_IMAGE_SIDE { img.thumbnail(MAX_IMAGE_SIDE, MAX_IMAGE_SIDE) } else { img };
     let rgba = img.to_rgba8();
@@ -1768,18 +2080,28 @@ fn load_diff(r: &Repo, target: &DiffTarget, file: Option<&FileStatus>, has_head:
         DiffTarget::Commit { file, .. } | DiffTarget::Shelf { file, .. } => file.path.clone(),
     };
     let mut data = DiffData { title, path: path.clone(), diff, old_image: None, new_image: None, old_size: None, new_size: None };
-    let want_bytes = is_image_path(&path) || data.diff.binary || data.diff.lfs.is_some();
-    if want_bytes {
-        let old_bytes = old.and_then(|(rev, p)| r.blob_bytes(&rev, &p).ok());
-        let new_bytes = new.and_then(|(rev, p)| match rev {
-            Some(rev) => r.blob_bytes(&rev, &p).ok(),
-            None => std::fs::read(r.abs(&p)).ok(),
+    let want_sizes = is_image_path(&path) || data.diff.binary || data.diff.lfs.is_some();
+    if want_sizes {
+        // Sizes come from the file system, the LFS pointer or git's object header: a 4 GB video is never read into
+        // memory (or downloaded from the LFS server) just to say how big it is.
+        let (old_ptr, new_ptr) = data.diff.lfs.clone().unwrap_or((None, None));
+        data.old_size = old.as_ref().and_then(|(rev, p)| old_ptr.map(|l| l.size).or_else(|| r.blob_size(rev, p)));
+        data.new_size = new.as_ref().and_then(|(rev, p)| match rev {
+            Some(rev) => new_ptr.map(|l| l.size).or_else(|| r.blob_size(rev, p)),
+            None => r.file_size(p),
         });
-        data.old_size = old_bytes.as_ref().map(|b| b.len() as u64);
-        data.new_size = new_bytes.as_ref().map(|b| b.len() as u64);
         if is_image_path(&path) {
-            data.old_image = old_bytes.as_deref().and_then(decode_image);
-            data.new_image = new_bytes.as_deref().and_then(decode_image);
+            let small = |size: Option<u64>| size.is_some_and(|s| s <= MAX_PREVIEW_BYTES);
+            if small(data.old_size) {
+                data.old_image = old.and_then(|(rev, p)| r.blob_bytes(&rev, &p).ok()).as_deref().and_then(decode_image);
+            }
+            if small(data.new_size) {
+                let bytes = new.and_then(|(rev, p)| match rev {
+                    Some(rev) => r.blob_bytes(&rev, &p).ok(),
+                    None => std::fs::read(r.abs(&p)).ok(),
+                });
+                data.new_image = bytes.as_deref().and_then(decode_image);
+            }
         }
     }
     Ok(data)

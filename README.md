@@ -83,8 +83,9 @@ remotes, stashes, cherry-pick and "back out this change" (revert commit).
 
 * **It uses your installed `git`.** g4v doesn't reimplement Git. Every operation runs the real `git` command line,
   so LFS filters, hooks, credential managers, submodules and your config behave exactly as they would in a terminal.
-* **Nothing can hang.** Editors and terminal prompts are disabled for every command (`GIT_EDITOR=true`,
-  `GIT_TERMINAL_PROMPT=0`). Sign-in goes through your credential manager's own window.
+* **No terminal prompts.** Editors and terminal prompts are disabled for every command (`GIT_EDITOR=true`,
+  `GIT_TERMINAL_PROMPT=0`). Sign-in goes through your credential manager's own window. Network services,
+  filters and hooks can still take time; the UI remains available while they run.
 * **Paths are taken literally.** `GIT_LITERAL_PATHSPECS=1` is set and file lists go through
   `--pathspec-from-file`, so names like `hero [final] v2.psd` are never treated as patterns and huge selections never
   run into command-line length limits.
@@ -93,6 +94,11 @@ remotes, stashes, cherry-pick and "back out this change" (revert commit).
   separately so they never block local work.
 * **No force push, no hard reset.** Those buttons don't exist. Branch delete is the safe kind unless you explicitly
   choose to discard unmerged work.
+* **Recovery for staged and ignored work.** Replacing staged changes first preserves the index in an automatic
+  shelf. Restoring a shelf or revision also backs up ignored files that would be overwritten. Taking a conflict
+  side or aborting an operation preserves current file edits in an automatic shelf.
+* **Fresh submit checks.** Lockable files are checked against the server when Submit executes. If locks cannot be
+  verified, reconnect or untick Upload to make a local commit. Nested attribute files are supported.
 * **Everything g4v stores is plain Git data** you can inspect or remove with standard tools:
   * changelists live in `.git/g4v/changelists.json` (written atomically; a corrupt file is moved aside, not
     silently discarded)
@@ -164,6 +170,15 @@ cargo test
 ```bash
 cargo clippy --all-targets
 ```
+
+Large-batch profiling (temporary repositories; default 5,000 modified and 1,250 new files):
+
+```bash
+cargo test --release --test perf -- --ignored --nocapture --test-threads=1
+```
+
+Set `G4V_PERF_FILES` to change the batch size and `G4V_PERF_LOG=1` to print slow Git commands.
+See [the hardening and profiling report](docs/hardening-review.md) for findings, measured results, and limits.
 
 The integration tests run against real repositories and cover submitting only selected files, out-of-date detection,
 the Get Latest safety stop, push rejection followed by automatic rebase, keep-mine and take-theirs during rebases and

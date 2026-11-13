@@ -48,11 +48,13 @@ pub struct FileStatus {
 impl FileStatus {
     /// For conflicts: does "our" side (HEAD) still have the file?
     pub fn conflict_ours_exists(&self) -> bool {
-        matches!(self.x, 'A' | 'U')
+        // AU = added by us, UD = deleted by them, AA = both added, UU = both modified.
+        matches!((self.x, self.y), ('A', 'U') | ('U', 'D') | ('A', 'A') | ('U', 'U'))
     }
     /// For conflicts: does "their" side still have the file?
     pub fn conflict_theirs_exists(&self) -> bool {
-        matches!(self.y, 'A' | 'U')
+        // UA = added by them, DU = deleted by us, AA = both added, UU = both modified.
+        matches!((self.x, self.y), ('U', 'A') | ('D', 'U') | ('A', 'A') | ('U', 'U'))
     }
     /// Whether the file is present in HEAD (i.e. reverting means restoring rather than deleting).
     pub fn in_head(&self) -> bool {
@@ -300,6 +302,22 @@ u UU N... 100644 100644 100644 100644 a b c conf.txt\0\
         assert_eq!(get("conf.txt").kind, ChangeKind::Conflict);
         assert!(get("art/new file.psd").untracked);
         assert_eq!(get("gone.txt").kind, ChangeKind::Delete);
+    }
+
+    #[test]
+    fn conflict_sides() {
+        let side = |xy: &str| {
+            let raw = format!("u {xy} N... 100644 100644 100644 100644 a b c f.txt\0");
+            let f = parse_porcelain_v2(raw.as_bytes()).1.remove(0);
+            (f.conflict_ours_exists(), f.conflict_theirs_exists())
+        };
+        assert_eq!(side("UU"), (true, true));
+        assert_eq!(side("AA"), (true, true));
+        assert_eq!(side("AU"), (true, false), "added by us");
+        assert_eq!(side("UA"), (false, true), "added by them");
+        assert_eq!(side("UD"), (true, false), "deleted by them");
+        assert_eq!(side("DU"), (false, true), "deleted by us");
+        assert_eq!(side("DD"), (false, false));
     }
 
     #[test]

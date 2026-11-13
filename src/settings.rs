@@ -54,7 +54,13 @@ impl Settings {
     }
 
     pub fn load() -> Settings {
-        Self::path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+        let Some(p) = Self::path() else { return Settings::default() };
+        let Ok(text) = std::fs::read_to_string(&p) else { return Settings::default() };
+        serde_json::from_str(&text).unwrap_or_else(|_| {
+            // Keep the unreadable file so the list of open projects can be recovered by hand.
+            let _ = std::fs::copy(&p, p.with_extension("json.bak"));
+            Settings::default()
+        })
     }
 
     pub fn save(&self) {
@@ -63,9 +69,13 @@ impl Settings {
             let _ = std::fs::create_dir_all(d);
         }
         if let Ok(text) = serde_json::to_string_pretty(self) {
-            let tmp = p.with_extension("json.tmp");
-            if std::fs::write(&tmp, text).is_ok() {
-                let _ = std::fs::rename(tmp, p);
+            use std::io::Write;
+            if let Some(parent) = p.parent() {
+                if let Ok(mut tmp) = tempfile::NamedTempFile::new_in(parent) {
+                    if tmp.write_all(text.as_bytes()).is_ok() && tmp.as_file().sync_all().is_ok() {
+                        let _ = tmp.persist(p);
+                    }
+                }
             }
         }
     }

@@ -5,6 +5,7 @@
 
 use super::status::{FileStatus, RepoOp};
 use super::{run_global, CmdLog, GitError, GitResult, Repo};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
 
@@ -122,18 +123,28 @@ impl Repo {
         if paths.is_empty() {
             return Err(user_error("commit", "No files selected."));
         }
-        self.git().args(["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"]).stdin_paths(paths).run()?;
+        let status = self.status()?;
+        if status.has_conflicts() || status.op != RepoOp::None {
+            return Err(user_error("commit", "Finish resolving the current operation and use Continue before submitting."));
+        }
+        self.backup_staged_paths(paths)?;
+        self.stage_paths(None, paths)?;
+        // A render may have disappeared since the dialog opened. Only pass actual selected changes to --only;
+        // unknown paths otherwise reject the whole batch. This does not expand the user's selection.
+        let staged = self.git().args(["diff", "--cached", "--name-only", "--no-renames", "-z"]).quiet().run()?;
+        let changed: HashSet<String> = super::split_nul(&staged.stdout).into_iter().collect();
+        let selected: Vec<&String> = paths.iter().filter(|p| changed.contains(*p)).collect();
+        if selected.is_empty() {
+            return Err(user_error("commit", "The selected files have no changes to submit. Refresh the project."));
+        }
         std::fs::create_dir_all(self.meta_dir()).ok();
         let msg_file = self.meta_dir().join("COMMIT_MSG");
         std::fs::write(&msg_file, message.trim().as_bytes())
             .map_err(|e| user_error("commit", &format!("Could not write the commit message: {e}")))?;
-        let res = self
-            .git()
-            .args(["commit", "--only", "--cleanup=whitespace", "-F"])
-            .arg(&msg_file)
-            .args(["--pathspec-from-file=-", "--pathspec-file-nul"])
-            .stdin_paths(paths)
-            .run();
+        let commit = self.git().args(["commit", "--cleanup=whitespace", "-F"]).arg(&msg_file);
+        // Enforce selection inside Git's index transaction. Checking the index and then running a plain commit
+        // races another editor staging files between those commands.
+        let res = commit.args(["--only", "--pathspec-from-file=-", "--pathspec-file-nul"]).stdin_paths(&selected).run();
         let _ = std::fs::remove_file(&msg_file);
         res?;
         self.run(&["rev-parse", "HEAD"])
@@ -163,6 +174,12 @@ impl Repo {
 
     /// Discards local changes to `files`. Callers should back them up first.
     pub fn revert_files(&self, files: &[FileStatus]) -> GitResult<()> {
+        // A queued action can outlive the status shown on screen (or another Git client can have committed it).
+        let wanted: HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        let current = self.status()?;
+        let files: Vec<_> = current.files.iter().filter(|f| wanted.contains(f.path.as_str())).collect();
+        let paths: Vec<String> = files.iter().flat_map(|f| std::iter::once(f.path.clone()).chain(f.orig_path.clone())).collect();
+        self.backup_staged_paths(&paths)?;
         let mut restore: Vec<String> = Vec::new();
         let mut unstage_new: Vec<String> = Vec::new();
         let mut delete: Vec<String> = Vec::new();
@@ -175,7 +192,8 @@ impl Repo {
             }
             if f.untracked {
                 delete.push(f.path.clone());
-            } else if f.x == 'A' || f.x == 'R' || f.x == 'C' {
+            } else if f.x == 'A' || f.x == 'R' || f.x == 'C' || (f.x == '.' && f.y == 'A') {
+                // Staged as new (or `git add -N`): not in HEAD, so reverting means removing it.
                 unstage_new.push(f.path.clone());
                 delete.push(f.path.clone());
                 if let Some(o) = &f.orig_path {
@@ -203,7 +221,7 @@ impl Repo {
                 .run()?;
         }
         for p in &delete {
-            let abs = self.abs(p);
+            let abs = self.deletion_path(p)?;
             if abs.is_file() || abs.is_symlink() {
                 std::fs::remove_file(&abs)
                     .map_err(|e| user_error("revert", &format!("Could not delete {p}: {e} (is it open in another program?)")))?;
@@ -217,7 +235,8 @@ impl Repo {
     }
 
     /// Get Latest: fetch, then fast-forward / rebase / merge onto the upstream.
-    /// `dirty` are the paths with uncommitted local changes.
+    /// `dirty` are paths the caller knows to have uncommitted local changes; the working copy is checked again here,
+    /// so a stale or empty list can never let local edits be overwritten.
     pub fn sync(&self, mode: PullMode, dirty: &[String]) -> GitResult<SyncOutcome> {
         self.fetch()?;
         let status = self.status()?;
@@ -235,8 +254,9 @@ impl Repo {
             self.update_submodules_if_any()?;
             return Ok(SyncOutcome::UpToDate);
         }
-        let incoming = self.incoming_files()?;
-        let mut overlap: Vec<String> = dirty.iter().filter(|p| incoming.contains(p)).cloned().collect();
+        let incoming: HashSet<String> = self.incoming_files()?.into_iter().collect();
+        let local = status.files.iter().flat_map(|f| std::iter::once(&f.path).chain(f.orig_path.as_ref()));
+        let mut overlap: Vec<String> = dirty.iter().chain(local).filter(|p| incoming.contains(*p)).cloned().collect();
         overlap.sort();
         overlap.dedup();
         if !overlap.is_empty() {
@@ -263,6 +283,15 @@ impl Repo {
 
     /// Resolves a conflicted file by taking one complete side.
     pub fn resolve_take(&self, f: &FileStatus, side: Side, op: RepoOp) -> GitResult<()> {
+        let status = self.status()?;
+        let f = status
+            .find(&f.path)
+            .filter(|f| f.kind == super::status::ChangeKind::Conflict)
+            .ok_or_else(|| user_error("resolve", "This file is no longer conflicted. Refresh the project before resolving."))?;
+        if status.op != op {
+            return Err(user_error("resolve", "The operation changed since this conflict was displayed. Refresh the project."));
+        }
+        self.create_shelf(std::slice::from_ref(&f.path), &format!("{}before resolving {}", super::shelf::BACKUP_TAG, f.path))?;
         // During a rebase git's "ours" is the upstream and "theirs" is my commit.
         let use_ours = match (op, side) {
             (RepoOp::Rebase, Side::Mine) => false,
@@ -317,6 +346,15 @@ impl Repo {
     }
 
     pub fn abort_op(&self, op: RepoOp) -> GitResult<()> {
+        let status = self.status()?;
+        if status.op != op {
+            return Err(user_error("abort", "The operation changed. Refresh the project before aborting."));
+        }
+        let paths: Vec<String> =
+            status.files.iter().filter(|f| !f.submodule).flat_map(|f| std::iter::once(f.path.clone()).chain(f.orig_path.clone())).collect();
+        if op != RepoOp::None && !paths.is_empty() {
+            self.create_shelf(&paths, &format!("{}before aborting {}", super::shelf::BACKUP_TAG, op.label()))?;
+        }
         match op {
             RepoOp::Merge => self.git().args(["merge", "--abort"]).run()?,
             RepoOp::Rebase => self.git().args(["rebase", "--abort"]).run()?,

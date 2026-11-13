@@ -3,7 +3,6 @@
 use super::tab::{first_line, Action, Dialog, RepoTab, SwitchTarget};
 use super::theme::{self, icon, ACCENT, MUTED, ORANGE, RED, YELLOW};
 use crate::changelists::DEFAULT_ID;
-use crate::settings::Settings;
 use eframe::egui::{self, RichText, Ui};
 
 enum Outcome {
@@ -42,8 +41,10 @@ fn file_checklist(ui: &mut Ui, files: &mut [(String, bool)], id: &str, annotate:
             }
         }
     });
-    egui::ScrollArea::vertical().id_salt(id).max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
-        for (path, on) in files.iter_mut() {
+    // Only the rows in view are built, so a changelist with thousands of files opens and scrolls instantly.
+    let row_h = list_row_height(ui);
+    egui::ScrollArea::vertical().id_salt(id).max_height(220.0).auto_shrink([false, true]).show_rows(ui, row_h, files.len(), |ui, range| {
+        for (path, on) in files[range].iter_mut() {
             ui.horizontal(|ui| {
                 ui.checkbox(on, path.as_str());
                 if let Some((note, color)) = annotate(path) {
@@ -54,24 +55,44 @@ fn file_checklist(ui: &mut Ui, files: &mut [(String, bool)], id: &str, annotate:
     });
 }
 
+/// Height of one checkbox row (without the spacing between rows).
+fn list_row_height(ui: &Ui) -> f32 {
+    ui.spacing().interact_size.y.max(ui.text_style_height(&egui::TextStyle::Body))
+}
+
+/// "a, b, c and 12 more".
+fn some_of(items: impl ExactSizeIterator<Item = String>, n: usize) -> String {
+    let total = items.len();
+    let mut s = items.take(n).collect::<Vec<_>>().join(", ");
+    if total > n {
+        s.push_str(&format!(" and {} more", total - n));
+    }
+    s
+}
+
 impl RepoTab {
-    pub fn dialogs(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>, settings: &Settings) {
+    pub fn dialogs(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let Some(mut dlg) = self.dialog.take() else { return };
         let mut outcome = Outcome::Keep;
         let modal = egui::Modal::new(egui::Id::unique(("g4v_dialog", self.repo.root().to_string_lossy().to_string())));
         let resp = modal.show(ctx, |ui| {
             ui.set_width(560.0);
-            outcome = self.dialog_body(ui, &mut dlg, actions, settings);
+            outcome = self.dialog_body(ui, &mut dlg, actions);
         });
         if resp.should_close() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             outcome = Outcome::Close;
+        }
+        if let (Outcome::Close, Dialog::Submit(d)) = (&outcome, &dlg) {
+            // However the dialog closes (Cancel, Escape, or a submit that then fails), the description that was typed
+            // is kept and offered again next time. It is dropped once the change is actually committed.
+            self.submit_draft = Some((d.cl_id, d.message.clone()));
         }
         if matches!(outcome, Outcome::Keep) && self.dialog.is_none() {
             self.dialog = Some(dlg);
         }
     }
 
-    fn dialog_body(&mut self, ui: &mut Ui, dlg: &mut Dialog, actions: &mut Vec<Action>, settings: &Settings) -> Outcome {
+    fn dialog_body(&mut self, ui: &mut Ui, dlg: &mut Dialog, actions: &mut Vec<Action>) -> Outcome {
         match dlg {
             Dialog::Submit(d) => {
                 let title = if d.cl_id == DEFAULT_ID { "Submit changelist".to_string() } else { format!("Submit changelist #{}", d.cl_id) };
@@ -100,7 +121,11 @@ impl RepoTab {
 
                 // ---- safety checks
                 let blocked = self.locked_by_others(&chosen);
-                let large = self.large_non_lfs(&chosen, settings.large_file_mb);
+                let large: Vec<(&String, u64)> = if d.large.is_empty() {
+                    Vec::new()
+                } else {
+                    chosen.iter().filter(|p| !self.lfs_paths.contains(*p)).filter_map(|p| d.large.get(p).map(|s| (p, *s))).collect()
+                };
                 let unlocked = self.lockable_not_locked(&chosen);
                 let outdated: Vec<&String> = chosen.iter().filter(|p| self.incoming.contains_key(*p)).collect();
                 let empty_msg = d.message.trim().is_empty();
@@ -110,7 +135,7 @@ impl RepoTab {
                             "{} {} file(s) are checked out by someone else. Untick them or ask the owner to release the lock: {}",
                             icon::LOCK,
                             blocked.len(),
-                            blocked.iter().map(|(p, o)| format!("{p} ({o})")).collect::<Vec<_>>().join(", ")
+                            some_of(blocked.iter().map(|(p, o)| format!("{p} ({o})")), 5)
                         ));
                     });
                 }
@@ -120,14 +145,24 @@ impl RepoTab {
                             "{} Large file(s) not stored with Git LFS will make the repository slow for everyone:",
                             icon::WARN
                         ));
-                        for (p, s) in &large {
+                        for (p, s) in large.iter().take(6) {
                             ui.label(format!("  {p} ({})", theme::format_size(*s)));
-                            if let Some(ext) = p.rsplit_once('.').map(|(_, e)| e.to_lowercase()) {
+                        }
+                        if large.len() > 6 {
+                            ui.label(format!("  …and {} more", large.len() - 6));
+                        }
+                        // One button per file type, however many files there are.
+                        let mut exts: Vec<String> =
+                            large.iter().filter_map(|(p, _)| p.rsplit_once('.').map(|(_, e)| e.to_lowercase())).collect();
+                        exts.sort();
+                        exts.dedup();
+                        ui.horizontal_wrapped(|ui| {
+                            for ext in exts.iter().take(8) {
                                 if ui.small_button(format!("Store *.{ext} with LFS")).clicked() {
                                     actions.push(Action::TrackLfs(format!("*.{ext}")));
                                 }
                             }
-                        }
+                        });
                         ui.label(theme::small("After enabling LFS, cancel and submit again so .gitattributes is included."));
                     });
                 }
@@ -141,6 +176,14 @@ impl RepoTab {
                         if ui.small_button("Check them out now").clicked() {
                             actions.push(Action::Lock(unlocked.clone()));
                         }
+                    });
+                }
+                if self.locks_err.is_some() && chosen.iter().any(|p| self.lockable.contains(p)) {
+                    theme::banner(ui, YELLOW, |ui| {
+                        ui.label(format!(
+                            "{} g4v couldn't verify file locks. Reconnect before submitting, or untick Upload to save a local commit. Locks are checked again when submitting.",
+                            icon::LOCK
+                        ));
                     });
                 }
                 if !outdated.is_empty() {
@@ -233,16 +276,15 @@ impl RepoTab {
                 ui.heading(format!("{} Unshelve \"{}\"", icon::SHELVE, first_line(&d.shelf.display_name())));
                 ui.label(theme::small(format!("by {} · {}", d.shelf.author, theme::format_time(d.shelf.time))));
                 ui.add_space(4.0);
-                let mut overwrite = 0;
-                egui::ScrollArea::vertical().id_salt("unshelve_files").max_height(240.0).show(ui, |ui| {
-                    for (f, on) in d.files.iter_mut() {
+                let overwrite = d.files.iter().filter(|(f, on)| *on && self.file(&f.path).is_some()).count();
+                let row_h = list_row_height(ui);
+                let total = d.files.len();
+                egui::ScrollArea::vertical().id_salt("unshelve_files").max_height(240.0).show_rows(ui, row_h, total, |ui, range| {
+                    for (f, on) in d.files[range].iter_mut() {
                         ui.horizontal(|ui| {
                             let label = format!("{} {}", if f.status == 'D' { icon::DELETE } else { icon::EDIT }, f.path);
                             ui.checkbox(on, label);
                             if self.file(&f.path).is_some() {
-                                if *on {
-                                    overwrite += 1;
-                                }
                                 ui.label(RichText::new("you have local edits").small().color(ORANGE));
                             }
                         });
@@ -257,9 +299,12 @@ impl RepoTab {
                     });
                 }
                 if d.shelf.base.is_some() && self.status.as_ref().and_then(|s| s.branch.oid.clone()) != d.shelf.base {
-                    ui.label(theme::small(
-                        "This shelf was made on a different version than you have. Files are copied as they were shelved.",
-                    ));
+                    theme::banner(ui, YELLOW, |ui| {
+                        ui.label(format!(
+                            "{} This shelf was made from a different version of the project than you have now. The files come back exactly as they were shelved, so if a teammate has changed the same files since then, submitting them would undo that work. Look at the diff before you submit.",
+                            icon::WARN
+                        ));
+                    });
                 }
                 ui.label(theme::small("The files will be put in a new changelist named after the shelf. The shelf itself is kept."));
                 let chosen: Vec<String> = d.files.iter().filter(|f| f.1).map(|f| f.0.path.clone()).collect();

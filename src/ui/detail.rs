@@ -20,17 +20,13 @@ impl RepoTab {
         match self.center {
             CenterTab::History if self.selected_commit.is_some() => {
                 ui.columns(2, |cols| {
-                    egui::ScrollArea::vertical().id_salt("commit_info").auto_shrink([false, false]).show(&mut cols[0], |ui| {
-                        self.commit_info(ui, actions);
-                    });
+                    self.commit_info(&mut cols[0], actions);
                     self.diff_ui(&mut cols[1]);
                 });
             }
             CenterTab::Shelves if self.selected_shelf.is_some() => {
                 ui.columns(2, |cols| {
-                    egui::ScrollArea::vertical().id_salt("shelf_info").auto_shrink([false, false]).show(&mut cols[0], |ui| {
-                        self.shelf_info(ui, actions);
-                    });
+                    self.shelf_info(&mut cols[0], actions);
                     self.diff_ui(&mut cols[1]);
                 });
             }
@@ -87,10 +83,17 @@ impl RepoTab {
         ui.separator();
         ui.label(theme::strong(format!("{} file(s)", d.files.len())));
         let parent = d.commit.parents.first().cloned();
-        for f in &d.files {
-            let target = DiffTarget::Commit { id: d.commit.id.clone(), parent: parent.clone(), file: f.clone() };
-            self.changed_file_row(ui, f, target, actions, Some(&d.commit.id));
-        }
+        egui::ScrollArea::vertical().id_salt("commit_files").auto_shrink([false, false]).show_rows(
+            ui,
+            super::widgets::ROW_H,
+            d.files.len(),
+            |ui, rows| {
+                for f in &d.files[rows] {
+                    let target = DiffTarget::Commit { id: d.commit.id.clone(), parent: parent.clone(), file: f.clone() };
+                    self.changed_file_row(ui, f, target, actions, Some(&d.commit.id));
+                }
+            },
+        );
     }
 
     fn changed_file_row(&self, ui: &mut Ui, f: &ChangedFile, target: DiffTarget, actions: &mut Vec<Action>, rev: Option<&str>) {
@@ -156,10 +159,17 @@ impl RepoTab {
             return;
         };
         ui.label(theme::strong(format!("{} file(s)", files.len())));
-        for f in &files {
-            let target = DiffTarget::Shelf { id: s.id.clone(), base: s.base.clone(), file: f.clone() };
-            self.changed_file_row(ui, f, target, actions, None);
-        }
+        egui::ScrollArea::vertical().id_salt("shelf_files").auto_shrink([false, false]).show_rows(
+            ui,
+            super::widgets::ROW_H,
+            files.len(),
+            |ui, rows| {
+                for f in &files[rows] {
+                    let target = DiffTarget::Shelf { id: s.id.clone(), base: s.base.clone(), file: f.clone() };
+                    self.changed_file_row(ui, f, target, actions, None);
+                }
+            },
+        );
     }
 
     pub fn diff_ui(&mut self, ui: &mut Ui) {

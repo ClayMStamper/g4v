@@ -3,6 +3,8 @@
 use super::{GitError, GitResult, Repo};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lock {
@@ -76,6 +78,39 @@ pub fn parse_check_attr(bytes: &[u8]) -> HashMap<String, String> {
     out
 }
 
+/// How many lock requests run at the same time. `git lfs lock` takes one file per call and each call is a round trip
+/// to the server, so checking out a folder of a few hundred files one by one would take minutes.
+const LOCK_PARALLELISM: usize = 8;
+
+/// Runs `op` for every path on a few threads. Returns (succeeded, failures), both in the order of `paths`.
+fn for_each_path(paths: &[String], op: impl Fn(&str) -> GitResult<()> + Sync) -> (Vec<String>, Vec<(String, String)>) {
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<Result<(), String>>>> = Mutex::new(vec![None; paths.len()]);
+    std::thread::scope(|scope| {
+        for _ in 0..LOCK_PARALLELISM.min(paths.len()) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                let Some(p) = paths.get(i) else { break };
+                let r = op(p).map_err(|e| e.to_string());
+                if let Ok(mut all) = results.lock() {
+                    all[i] = Some(r);
+                }
+            });
+        }
+    });
+    let results = results.into_inner().unwrap_or_else(|e| e.into_inner());
+    let mut ok = Vec::new();
+    let mut failed = Vec::new();
+    for (p, r) in paths.iter().zip(results) {
+        match r {
+            Some(Ok(())) => ok.push(p.clone()),
+            Some(Err(e)) => failed.push((p.clone(), e)),
+            None => failed.push((p.clone(), "the request did not finish".to_string())),
+        }
+    }
+    (ok, failed)
+}
+
 impl Repo {
     /// Whether this repository is configured for Git LFS at all.
     pub fn uses_lfs(&self) -> bool {
@@ -90,50 +125,48 @@ impl Repo {
 
     /// Lists all locks on the server.
     pub fn lfs_locks(&self) -> GitResult<Vec<Lock>> {
+        // With `--json`, git-lfs prints an empty list and reports success even when the server could not be reached
+        // or refused the request. An empty answer is therefore never taken at face value: it is confirmed with the
+        // plain-text form of the same command, which does report errors. Otherwise "offline" would look exactly like
+        // "nobody has anything checked out", and the guard against submitting files locked by someone else would
+        // silently switch off.
+        //
         // `--verify` tells us which locks are ours; not every server supports it.
         if let Ok(out) = self.git().args(["lfs", "locks", "--verify", "--json"]).quiet().run() {
             if let Some(v) = parse_verified_locks(&out.text()) {
-                return Ok(v);
+                if !v.is_empty() || self.git().args(["lfs", "locks", "--verify"]).quiet().run().is_ok() {
+                    return Ok(v);
+                }
             }
         }
         let out = self.git().args(["lfs", "locks", "--json"]).quiet().run()?;
         let me = self.config_get("user.name");
-        parse_plain_locks(&out.text(), me.as_deref()).ok_or_else(|| GitError {
+        let locks = parse_plain_locks(&out.text(), me.as_deref()).ok_or_else(|| GitError {
             command: "git lfs locks --json".into(),
             code: None,
             stderr: "Could not read lock list from the server".into(),
             stdout: out.text(),
-        })
+        })?;
+        if locks.is_empty() {
+            self.git().args(["lfs", "locks"]).quiet().run()?;
+        }
+        Ok(locks)
     }
 
     /// Locks files. Returns (locked, failures).
     pub fn lfs_lock(&self, paths: &[String]) -> (Vec<String>, Vec<(String, String)>) {
-        let mut ok = Vec::new();
-        let mut failed = Vec::new();
-        for p in paths {
-            match self.git().args(["lfs", "lock", "--json", "--"]).arg(p).run() {
-                Ok(_) => ok.push(p.clone()),
-                Err(e) => failed.push((p.clone(), e.to_string())),
-            }
-        }
-        (ok, failed)
+        for_each_path(paths, |p| self.git().args(["lfs", "lock", "--json", "--"]).arg(p).run().map(|_| ()))
     }
 
     /// Unlocks files. `force` breaks someone else's lock (admin).
     pub fn lfs_unlock(&self, paths: &[String], force: bool) -> (Vec<String>, Vec<(String, String)>) {
-        let mut ok = Vec::new();
-        let mut failed = Vec::new();
-        for p in paths {
+        for_each_path(paths, |p| {
             let mut cmd = self.git().args(["lfs", "unlock", "--json"]);
             if force {
                 cmd = cmd.arg("--force");
             }
-            match cmd.arg("--").arg(p).run() {
-                Ok(_) => ok.push(p.clone()),
-                Err(e) => failed.push((p.clone(), e.to_string())),
-            }
-        }
-        (ok, failed)
+            cmd.arg("--").arg(p).run().map(|_| ())
+        })
     }
 
     fn check_attr(&self, attr: &str, paths: &[String]) -> GitResult<HashMap<String, String>> {
@@ -177,6 +210,23 @@ mod tests {
         assert!(v[0].ours);
         assert!(!v[1].ours);
         assert_eq!(v[1].owner, "bob");
+    }
+
+    #[test]
+    fn batches_keep_order_and_report_each_failure() {
+        let paths: Vec<String> = (0..100).map(|i| format!("f{i}.psd")).collect();
+        let (ok, failed) = for_each_path(&paths, |p| {
+            if p.ends_with("7.psd") {
+                Err(GitError { command: "lock".into(), code: Some(1), stderr: format!("{p} is locked"), stdout: String::new() })
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(ok.len(), 90);
+        assert_eq!(failed.len(), 10);
+        assert_eq!(ok[0], "f0.psd");
+        assert_eq!(failed[0], ("f7.psd".to_string(), "f7.psd is locked".to_string()));
+        assert_eq!(for_each_path(&[], |_| Ok(())), (vec![], vec![]));
     }
 
     #[test]

@@ -12,6 +12,7 @@ type Job<T> = Box<dyn FnOnce(&Repo) -> T + Send + 'static>;
 pub struct Worker<T: Send + 'static> {
     tx: Option<Sender<(String, Job<T>)>>,
     rx: Receiver<T>,
+    errors: Receiver<String>,
     pending: Arc<AtomicUsize>,
     current: Arc<Mutex<Option<String>>>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -21,6 +22,7 @@ impl<T: Send + 'static> Worker<T> {
     pub fn new(repo: Repo, name: &str, repaint: impl Fn() + Send + 'static) -> Self {
         let (tx, job_rx) = channel::<(String, Job<T>)>();
         let (res_tx, rx) = channel::<T>();
+        let (error_tx, errors) = channel();
         let pending = Arc::new(AtomicUsize::new(0));
         let current = Arc::new(Mutex::new(None));
         let p = pending.clone();
@@ -30,7 +32,7 @@ impl<T: Send + 'static> Worker<T> {
             .spawn(move || {
                 while let Ok((label, job)) = job_rx.recv() {
                     if let Ok(mut c) = cur.lock() {
-                        *c = Some(label);
+                        *c = Some(label.clone());
                     }
                     repaint();
                     // A panicking job must never take the worker (and the UI's view of the repo) down.
@@ -38,17 +40,20 @@ impl<T: Send + 'static> Worker<T> {
                     if let Ok(mut c) = cur.lock() {
                         *c = None;
                     }
+                    // Send first, then report idle: "not busy" then always means "every result has been delivered".
+                    let delivered = match result {
+                        Ok(r) => res_tx.send(r).is_ok(),
+                        Err(_) => error_tx.send(format!("{label} stopped unexpectedly. Refresh the project and check its state before retrying; backup shelves are available in Shelves.")).is_ok(),
+                    };
                     p.fetch_sub(1, Ordering::SeqCst);
-                    if let Ok(r) = result {
-                        if res_tx.send(r).is_err() {
-                            break;
-                        }
+                    if !delivered {
+                        break;
                     }
                     repaint();
                 }
             })
             .expect("failed to spawn worker thread");
-        Worker { tx: Some(tx), rx, pending, current, handle: Some(handle) }
+        Worker { tx: Some(tx), rx, errors, pending, current, handle: Some(handle) }
     }
 
     pub fn submit(&self, label: impl Into<String>, job: impl FnOnce(&Repo) -> T + Send + 'static) {
@@ -62,6 +67,10 @@ impl<T: Send + 'static> Worker<T> {
 
     pub fn poll(&self) -> Vec<T> {
         self.rx.try_iter().collect()
+    }
+
+    pub fn poll_errors(&self) -> Vec<String> {
+        self.errors.try_iter().collect()
     }
 
     pub fn busy(&self) -> bool {

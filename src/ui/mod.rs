@@ -17,10 +17,21 @@ use tab::{AppRequest, RepoTab};
 use theme::{icon, ACCENT, MUTED, RED};
 
 enum GlobalDialog {
-    Clone { url: String, parent: String, name: String, name_edited: bool },
-    Cloning { url: String, rx: Receiver<Result<PathBuf, String>> },
-    Init { path: String },
-    Settings,
+    Clone {
+        url: String,
+        parent: String,
+        name: String,
+        name_edited: bool,
+    },
+    Cloning {
+        url: String,
+        rx: Receiver<Result<PathBuf, String>>,
+    },
+    Init {
+        path: String,
+    },
+    /// Holds the global git identity, looked up once when the dialog opens.
+    Settings(crate::git::ops::Identity),
     About,
     Help,
     Error(String),
@@ -85,6 +96,12 @@ impl G4vApp {
 
     fn close_tab(&mut self, i: usize) {
         if i < self.tabs.len() {
+            if self.tabs[i].has_pending_work() {
+                self.dialog = Some(GlobalDialog::Error(
+                    "This project still has an operation running. Wait for it to finish before closing the tab.".into(),
+                ));
+                return;
+            }
             self.tabs.remove(i);
             if self.active >= self.tabs.len() {
                 self.active = self.tabs.len().saturating_sub(1);
@@ -140,7 +157,7 @@ impl G4vApp {
                 }
                 if ui.button("Settings…").clicked() {
                     ui.close();
-                    self.dialog = Some(GlobalDialog::Settings);
+                    self.dialog = Some(GlobalDialog::Settings(crate::git::ops::global_identity(&self.log)));
                 }
                 ui.separator();
                 if ui.button("Exit").clicked() {
@@ -405,8 +422,9 @@ impl G4vApp {
                         });
                     });
                 }
-                GlobalDialog::Settings => {
+                GlobalDialog::Settings(global) => {
                     ui.heading("Settings");
+                    let before = self.settings.clone();
                     let s = &mut self.settings;
                     egui::Grid::new("settings_grid").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                         ui.label("Check the server every");
@@ -441,11 +459,10 @@ impl G4vApp {
                         ui.end_row();
                     });
                     ui.separator();
-                    let global = crate::git::ops::global_identity(&self.log);
                     ui.label(theme::small(format!(
                         "Git identity: {} <{}>",
-                        global.name.unwrap_or_else(|| "not set".into()),
-                        global.email.unwrap_or_else(|| "not set".into())
+                        global.name.as_deref().unwrap_or("not set"),
+                        global.email.as_deref().unwrap_or("not set")
                     )));
                     ui.horizontal(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -454,7 +471,9 @@ impl G4vApp {
                             }
                         });
                     });
-                    self.settings.save();
+                    if self.settings != before {
+                        self.settings.save();
+                    }
                 }
                 GlobalDialog::About => {
                     ui.heading("g4v");
@@ -594,6 +613,10 @@ impl eframe::App for G4vApp {
         // Background updates for every open tab (so tab badges stay live).
         for t in &mut self.tabs {
             t.tick(&ctx, &self.settings);
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && self.tabs.iter().any(RepoTab::has_pending_work) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.dialog = Some(GlobalDialog::Error("An operation is still running. Wait for it to finish before exiting g4v.".into()));
         }
         // Requests from tabs (e.g. open a submodule).
         let mut requests = Vec::new();

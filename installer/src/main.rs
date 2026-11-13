@@ -171,18 +171,12 @@ fn uninstall() -> Result<(), String> {
     let me = std::env::current_exe().ok();
     let uninstaller = dir.join(UNINSTALL_EXE);
     if me.as_deref() == Some(uninstaller.as_path()) {
-        let cmd = format!(
-            "ping 127.0.0.1 -n 3 > nul & del /f /q \"{}\" & rmdir \"{}\"",
-            uninstaller.display(),
-            dir.display()
-        );
-        let mut c = Command::new("cmd");
-        // cmd.exe has its own quoting rules; pass the command line through untouched.
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            c.raw_arg("/C").raw_arg(&cmd);
-        }
+        // Pass paths as data: cmd expands %variables% even inside quotes. Never recursively delete the directory.
+        let mut c = Command::new("powershell");
+        c.args(["-NoProfile", "-NonInteractive", "-Command",
+            "Start-Sleep -Seconds 2; Remove-Item -LiteralPath $env:G4V_REMOVE_EXE -Force; try { [System.IO.Directory]::Delete($env:G4V_REMOVE_DIR, $false) } catch {}"])
+            .env("G4V_REMOVE_EXE", &uninstaller)
+            .env("G4V_REMOVE_DIR", &dir);
         let _ = hide(&mut c).spawn();
     } else {
         let _ = std::fs::remove_file(&uninstaller);

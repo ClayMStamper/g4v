@@ -24,7 +24,7 @@ pub mod status;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -159,6 +159,12 @@ fn hide_window(cmd: &mut Command) {
 #[cfg(not(windows))]
 fn hide_window(_cmd: &mut Command) {}
 
+/// Deeply nested art folders easily pass Windows' 260 character path limit, which git only handles when asked to.
+#[cfg(windows)]
+const LONG_PATHS: [&str; 2] = ["-c", "core.longpaths=true"];
+#[cfg(not(windows))]
+const LONG_PATHS: [&str; 0] = [];
+
 fn apply_safe_env(cmd: &mut Command) {
     cmd.env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_EDITOR", "true")
@@ -245,13 +251,59 @@ impl Repo {
         self.root.join(rel)
     }
 
+    /// Files deleted directly by Rust must never follow a directory symlink outside the workspace.
+    pub(crate) fn deletion_path(&self, rel: &str) -> GitResult<PathBuf> {
+        let fail = || {
+            GitError {
+            command: "delete file".into(), code: None,
+            stderr: format!("Cannot safely delete {rel}: the path is invalid or passes through a linked folder. Restore the folder layout and try again."),
+            stdout: String::new(),
+        }
+        };
+        let components: Vec<_> = Path::new(rel).components().collect();
+        if components.is_empty() || components.iter().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            return Err(fail());
+        }
+        let mut path = self.root.clone();
+        for (i, component) in components.iter().enumerate() {
+            path.push(component.as_os_str());
+            if i + 1 < components.len() {
+                match std::fs::symlink_metadata(&path) {
+                    Ok(m) if m.is_symlink() => return Err(fail()),
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(fail()),
+                    _ => {}
+                }
+            }
+        }
+        Ok(path)
+    }
+
     pub fn git(&self) -> GitCmd<'_> {
-        GitCmd { repo: self, args: Vec::new(), stdin: None, envs: Vec::new(), ok_codes: vec![0], quiet: false }
+        GitCmd { repo: self, args: Vec::new(), stdin: None, envs: Vec::new(), ok_codes: vec![0], quiet: false, stdout_limit: None }
     }
 
     /// Convenience: run with args and return trimmed stdout.
     pub fn run(&self, args: &[&str]) -> GitResult<String> {
         Ok(self.git().args(args).run()?.text().trim_end().to_string())
+    }
+
+    /// Records the on-disk state of exactly `paths` in an index: files that exist are added or updated (through the
+    /// clean filters, so LFS works), files that are gone are removed. `index` selects a temporary index file; `None`
+    /// is the repository's own index.
+    ///
+    /// This is `git update-index` rather than `git add <pathspecs>` on purpose: paths are taken one by one instead of
+    /// being matched as patterns against every file, which is an order of magnitude faster for thousands of files,
+    /// and a path that no longer exists anywhere is simply skipped instead of failing the whole batch.
+    pub fn stage_paths<S: AsRef<str>>(&self, index: Option<&OsStr>, paths: &[S]) -> GitResult<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut cmd = self.git().args(["update-index", "--add", "--remove", "--replace", "-z", "--stdin"]);
+        if let Some(i) = index {
+            cmd = cmd.env("GIT_INDEX_FILE", i);
+        }
+        cmd.stdin_paths(paths).run()?;
+        Ok(())
     }
 
     /// Reads a config value, `None` when unset.
@@ -287,6 +339,7 @@ pub struct GitCmd<'a> {
     envs: Vec<(OsString, OsString)>,
     ok_codes: Vec<i32>,
     quiet: bool,
+    stdout_limit: Option<usize>,
 }
 
 impl<'a> GitCmd<'a> {
@@ -334,6 +387,12 @@ impl<'a> GitCmd<'a> {
         self
     }
 
+    /// Keep at most limit + 1 bytes, draining the rest so Git cannot block on a full pipe.
+    pub fn stdout_limit(mut self, limit: usize) -> Self {
+        self.stdout_limit = Some(limit);
+        self
+    }
+
     fn display(&self) -> String {
         let mut s = String::from("git");
         for a in &self.args {
@@ -354,6 +413,7 @@ impl<'a> GitCmd<'a> {
         let mut cmd = Command::new(git_exe());
         cmd.current_dir(&self.repo.root)
             .args(["-c", "core.quotepath=false", "-c", "color.ui=false", "-c", "advice.detachedHead=false"])
+            .args(LONG_PATHS)
             .args(&self.args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -369,20 +429,37 @@ impl<'a> GitCmd<'a> {
         let mut child = cmd.spawn().map_err(|e| fail(format!("Could not start git: {e}"), None, String::new()))?;
         // Write stdin from a helper thread so large inputs can't deadlock with stdout.
         let writer = match (self.stdin, child.stdin.take()) {
-            (Some(data), Some(mut pipe)) => Some(std::thread::spawn(move || {
-                let _ = pipe.write_all(&data);
-            })),
+            (Some(data), Some(mut pipe)) => Some(std::thread::spawn(move || pipe.write_all(&data))),
             _ => None,
         };
-        let out = child.wait_with_output().map_err(|e| fail(format!("git did not finish: {e}"), None, String::new()))?;
+        let reader = self.stdout_limit.map(|limit| {
+            let mut pipe = child.stdout.take().expect("stdout is piped");
+            std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+                let mut bytes = Vec::new();
+                pipe.by_ref().take(limit.saturating_add(1) as u64).read_to_end(&mut bytes)?;
+                std::io::copy(&mut pipe, &mut std::io::sink())?;
+                Ok(bytes)
+            })
+        });
+        let mut out = child.wait_with_output().map_err(|e| fail(format!("git did not finish: {e}"), None, String::new()))?;
+        if let Some(reader) = reader {
+            out.stdout = reader
+                .join()
+                .map_err(|_| fail("Could not read Git output".into(), None, String::new()))?
+                .map_err(|e| fail(format!("Could not read Git output: {e}"), None, String::new()))?;
+        }
         if let Some(w) = writer {
-            let _ = w.join();
+            let result = w.join().map_err(|_| fail("Could not send the full file selection to Git".into(), None, String::new()))?;
+            // Preserve Git's own diagnostic for early rejection, but never report a partially written batch as successful.
+            if out.status.success() {
+                result.map_err(|e| fail(format!("Could not send the full file selection to Git: {e}"), None, String::new()))?;
+            }
         }
         let code = out.status.code().unwrap_or(-1);
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         let ok = self.ok_codes.contains(&code);
         if !self.quiet || !ok {
-            let mut output = stderr.trim().to_string();
+            let mut output: String = stderr.trim().chars().take(8000).collect();
             if !ok && output.is_empty() {
                 output = String::from_utf8_lossy(&out.stdout).trim().chars().take(2000).collect();
             }

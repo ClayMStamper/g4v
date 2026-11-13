@@ -8,7 +8,7 @@ use crate::changelists::DEFAULT_ID;
 use crate::git::branches::RefKind;
 use crate::git::history::{GraphRow, HistoryScope};
 use crate::git::ops::Side;
-use crate::git::status::{ChangeKind, FileStatus, RepoOp, StatusSnapshot};
+use crate::git::status::{ChangeKind, FileStatus, RepoOp};
 use crate::git::CmdLog;
 use crate::settings::Settings;
 use eframe::egui::{self, Color32, RichText, Ui};
@@ -51,7 +51,7 @@ impl RepoTab {
                 CenterTab::Log => log_view(ui, log),
             });
         });
-        self.dialogs(ui.ctx(), &mut actions, settings);
+        self.dialogs(ui.ctx(), &mut actions);
         if ui.ctx().input(|i| i.key_pressed(egui::Key::F5)) {
             actions.push(Action::Refresh);
         }
@@ -66,17 +66,24 @@ impl RepoTab {
     }
 
     fn toolbar(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        let st = self.status.clone();
-        let behind = st.as_ref().map(|s| s.branch.behind).unwrap_or(0);
-        let ahead = st.as_ref().map(|s| s.branch.ahead).unwrap_or(0);
+        let behind = self.status.as_ref().map(|s| s.branch.behind).unwrap_or(0);
+        let ahead = self.status.as_ref().map(|s| s.branch.ahead).unwrap_or(0);
         let busy = self.is_busy();
-        let sel: Vec<String> = self.selection.iter().cloned().collect();
-        let sel_changed: Vec<String> = sel.iter().filter(|p| self.file(p).is_some()).cloned().collect();
-        let sel_lockable: Vec<String> =
-            sel.iter().filter(|p| self.lock_of(p).is_none() && self.file(p).is_none_or(|f| !f.untracked)).cloned().collect();
-        let sel_mine: Vec<String> = sel.iter().filter(|p| self.lock_of(p).is_some_and(|l| l.ours)).cloned().collect();
+        // Only "is there any?" is needed to enable the buttons; the lists are built when one is clicked.
+        fn is_changed(t: &RepoTab, p: &str) -> bool {
+            t.file(p).is_some()
+        }
+        fn is_lockable(t: &RepoTab, p: &str) -> bool {
+            t.lock_of(p).is_none() && t.file(p).is_none_or(|f| !f.untracked)
+        }
+        fn is_mine(t: &RepoTab, p: &str) -> bool {
+            t.lock_of(p).is_some_and(|l| l.ours)
+        }
+        let any_changed = self.selection.iter().any(|p| is_changed(self, p));
+        let any_lockable = self.selection.iter().any(|p| is_lockable(self, p));
+        let any_mine = self.selection.iter().any(|p| is_mine(self, p));
         let cl = self.active_changelist();
-        let pending_in_cl = self.cl_files(cl).iter().filter(|p| self.file(p).is_some()).count();
+        let pending_in_cl = self.pending().changed_in(cl);
 
         ui.horizontal(|ui| {
             if theme::tool_button(ui, icon::REFRESH, "Refresh", true, None, "Re-read the workspace and check the server (F5)").clicked() {
@@ -105,17 +112,21 @@ impl RepoTab {
             {
                 actions.push(Action::OpenSubmit(cl));
             }
-            let shelve_paths = if sel_changed.is_empty() { self.cl_files(cl) } else { sel_changed.clone() };
             if theme::tool_button(
                 ui,
                 icon::SHELVE,
                 "Shelve",
-                !busy && shelve_paths.iter().any(|p| self.file(p).is_some()),
+                !busy && (any_changed || pending_in_cl > 0),
                 None,
                 "Save the selected changes on the side without submitting them",
             )
             .clicked()
             {
+                let shelve_paths: Vec<String> = if any_changed {
+                    self.selection.iter().filter(|p| is_changed(self, p)).cloned().collect()
+                } else {
+                    self.cl_files(cl).to_vec()
+                };
                 actions.push(Action::OpenShelve(shelve_paths, Some(cl)));
             }
             let lock_tip = if self.uses_lfs {
@@ -123,25 +134,23 @@ impl RepoTab {
             } else {
                 "Locking needs Git LFS (see the Locks tab)"
             };
-            if theme::tool_button(ui, icon::LOCK, "Check Out", self.uses_lfs && !sel_lockable.is_empty(), None, lock_tip).clicked() {
-                actions.push(Action::Lock(sel_lockable));
+            if theme::tool_button(ui, icon::LOCK, "Check Out", self.uses_lfs && any_lockable, None, lock_tip).clicked() {
+                actions.push(Action::Lock(self.selection.iter().filter(|p| is_lockable(self, p)).cloned().collect()));
             }
-            if theme::tool_button(ui, icon::UNLOCK, "Release", !sel_mine.is_empty(), None, "Release your lock on the selected files")
-                .clicked()
-            {
-                actions.push(Action::Unlock(sel_mine, false));
+            if theme::tool_button(ui, icon::UNLOCK, "Release", any_mine, None, "Release your lock on the selected files").clicked() {
+                actions.push(Action::Unlock(self.selection.iter().filter(|p| is_mine(self, p)).cloned().collect(), false));
             }
             if theme::tool_button(
                 ui,
                 icon::REVERT,
                 "Revert",
-                !busy && !sel_changed.is_empty(),
+                !busy && any_changed,
                 None,
                 "Throw away local changes to the selected files (a backup is kept)",
             )
             .clicked()
             {
-                actions.push(Action::OpenRevert(sel_changed));
+                actions.push(Action::OpenRevert(self.selection.iter().filter(|p| is_changed(self, p)).cloned().collect()));
             }
             if ahead > 0 {
                 ui.separator();
@@ -216,7 +225,22 @@ impl RepoTab {
     }
 
     fn banners(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, settings: &Settings) {
-        let Some(st) = self.status.clone() else {
+        // Just the facts the banners need, not a copy of every pending file.
+        struct Facts {
+            op: RepoOp,
+            index_lock: bool,
+            branch: crate::git::status::BranchStatus,
+            conflicts: usize,
+            no_files: bool,
+        }
+        let facts = self.status.as_ref().map(|s| Facts {
+            op: s.op,
+            index_lock: s.index_lock,
+            branch: s.branch.clone(),
+            conflicts: s.conflicts().count(),
+            no_files: s.files.is_empty(),
+        });
+        let Some(st) = facts else {
             if let Some(e) = &self.status_err {
                 theme::banner(ui, RED, |ui| {
                     ui.label(format!("{} Could not read the workspace: {e}", icon::WARN));
@@ -252,7 +276,7 @@ impl RepoTab {
             }
         }
         if st.op != RepoOp::None {
-            let n = st.conflicts().count();
+            let n = st.conflicts;
             theme::banner(ui, RED, |ui| {
                 if n > 0 {
                     ui.label(
@@ -305,7 +329,11 @@ impl RepoTab {
             });
         }
         // Conflict risk: files I'm editing that changed on the server.
-        let risky: Vec<String> = st.files.iter().filter(|f| self.incoming.contains_key(&f.path)).map(|f| f.path.clone()).collect();
+        let risky: Vec<String> = if self.incoming.is_empty() {
+            Vec::new()
+        } else {
+            self.files().iter().filter(|f| self.incoming.contains_key(&f.path)).map(|f| f.path.clone()).collect()
+        };
         if !risky.is_empty() {
             theme::banner(ui, ORANGE, |ui| {
                 ui.label(format!(
@@ -317,7 +345,7 @@ impl RepoTab {
             });
         }
         // Edits to files someone else has locked.
-        let blocked = self.locked_by_others(st.files.iter().map(|f| &f.path));
+        let blocked = if self.locks.is_empty() { Vec::new() } else { self.locked_by_others(self.files().iter().map(|f| &f.path)) };
         if !blocked.is_empty() {
             theme::banner(ui, RED, |ui| {
                 let list: Vec<String> = blocked.iter().map(|(p, o)| format!("{p} ({o})")).collect();
@@ -329,7 +357,7 @@ impl RepoTab {
             });
         }
         // Edits to lockable files without a lock.
-        let unlocked = self.lockable_not_locked(st.files.iter().map(|f| &f.path));
+        let unlocked = if self.lockable.is_empty() { Vec::new() } else { self.lockable_not_locked(self.files().iter().map(|f| &f.path)) };
         if !unlocked.is_empty() && self.locks_err.is_none() {
             theme::banner(ui, YELLOW, |ui| {
                 ui.label(format!(
@@ -381,7 +409,7 @@ impl RepoTab {
             });
         }
         if let Some(shelf) = self.wip_shelf_for_current().cloned() {
-            if st.files.is_empty() {
+            if st.no_files {
                 theme::banner(ui, GREEN, |ui| {
                     ui.label(format!(
                         "{} You shelved work when you last left this branch ({}).",
@@ -889,7 +917,7 @@ impl RepoTab {
     // ------------------------------------------------------------ center
 
     fn center_tabs(&mut self, ui: &mut Ui) {
-        let pending = self.pending_paths().len() + self.status.as_ref().map(|s| s.conflicts().count()).unwrap_or(0);
+        let pending = self.pending().all.len() + self.status.as_ref().map(|s| s.conflicts().count()).unwrap_or(0);
         let shelves = self.shelves.iter().filter(|s| !s.is_backup()).count();
         let locks = self.locks.len();
         let mut switched = false;
@@ -921,10 +949,12 @@ impl RepoTab {
     }
 
     fn pending_view(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        let Some(st) = self.status.clone() else {
+        let Some(st) = &self.status else {
             ui.add(egui::Spinner::new());
             return;
         };
+        let conflicts: Vec<FileStatus> = st.conflicts().cloned().collect();
+        let op = st.op;
         ui.horizontal(|ui| {
             if ui
                 .button("✚ New changelist")
@@ -943,7 +973,7 @@ impl RepoTab {
             let background = ui
                 .scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
                     ui.set_min_height(ui.available_height());
-                    self.pending_list(ui, &st, modifiers, actions);
+                    self.pending_list(ui, &conflicts, op, modifiers, actions);
                 })
                 .response;
             if background.clicked() && !self.selection.is_empty() {
@@ -961,7 +991,7 @@ impl RepoTab {
             ui.close();
         }
         ui.separator();
-        let any_lists = !self.changelists.lists.is_empty() || !self.cl_files(DEFAULT_ID).is_empty();
+        let any_lists = !self.changelists.lists.is_empty() || !self.pending().all.is_empty();
         if ui.add_enabled(any_lists, egui::Button::new("Expand all")).clicked() {
             self.collapsed_cls.clear();
             ui.close();
@@ -978,18 +1008,17 @@ impl RepoTab {
         }
     }
 
-    fn pending_list(&mut self, ui: &mut Ui, st: &StatusSnapshot, modifiers: egui::Modifiers, actions: &mut Vec<Action>) {
+    fn pending_list(&mut self, ui: &mut Ui, conflicts: &[FileStatus], op: RepoOp, modifiers: egui::Modifiers, actions: &mut Vec<Action>) {
         ui.spacing_mut().item_spacing.y = 1.0;
         // Conflicts first.
-        let conflicts: Vec<FileStatus> = st.conflicts().cloned().collect();
-        if !conflicts.is_empty() || st.op != RepoOp::None {
-            self.conflicts_section(ui, &conflicts, st.op, actions);
+        if !conflicts.is_empty() || op != RepoOp::None {
+            self.conflicts_section(ui, conflicts, op, actions);
             ui.add_space(8.0);
         }
         let mut ids = vec![DEFAULT_ID];
         ids.extend(self.changelists.lists.iter().map(|c| c.id));
         // Order of all visible files for shift-selection.
-        let order: Vec<String> = ids.iter().flat_map(|id| self.cl_files(*id)).collect();
+        let order = self.pending().order.clone();
         if order.is_empty() && conflicts.is_empty() {
             ui.add_space(30.0);
             ui.vertical_centered(|ui| {
@@ -1063,7 +1092,7 @@ impl RepoTab {
         // The default list is shown when it has files, or as a drop target next to numbered lists.
         if id != DEFAULT_ID || !files.is_empty() || !self.changelists.lists.is_empty() {
             let collapsed = self.collapsed_cls.contains(&id);
-            let n_changed = files.iter().filter(|p| self.file(p).is_some()).count();
+            let n_changed = self.pending().changed_in(id);
             let title = if id == DEFAULT_ID { "Default changelist".to_string() } else { format!("#{id}  {}", self.changelist_name(id)) };
             // The click sense is attached to the header's own Ui *before* its buttons are added, so the buttons sit on
             // top and receive their clicks; the header only gets clicks (context menu, drops) that miss them.
@@ -1091,7 +1120,7 @@ impl RepoTab {
                                         .add_enabled(n_changed > 0, egui::Button::new(format!("{} Shelve", icon::SHELVE)).small())
                                         .clicked()
                                     {
-                                        actions.push(Action::OpenShelve(files.clone(), Some(id)));
+                                        actions.push(Action::OpenShelve(files.to_vec(), Some(id)));
                                     }
                                     if ui
                                         .add_enabled(
@@ -1120,11 +1149,11 @@ impl RepoTab {
                     ui.close();
                 }
                 if ui.button("Shelve…").clicked() {
-                    actions.push(Action::OpenShelve(files.clone(), Some(id)));
+                    actions.push(Action::OpenShelve(files.to_vec(), Some(id)));
                     ui.close();
                 }
                 if ui.button("Revert all files…").clicked() {
-                    actions.push(Action::OpenRevert(files.clone()));
+                    actions.push(Action::OpenRevert(files.to_vec()));
                     ui.close();
                 }
                 if id != DEFAULT_ID {
@@ -1145,7 +1174,18 @@ impl RepoTab {
             if files.is_empty() {
                 ui.label(theme::small("    (empty — drag files here)"));
             }
-            for path in &files {
+            // Only the rows inside the visible part of the scroll area are built; the rest is empty space of the same
+            // height. A changelist with 20,000 files costs the same per frame as one with 20.
+            let spacing = ui.spacing().item_spacing.y;
+            let pitch = ROW_H + spacing;
+            let top = ui.cursor().top();
+            let clip = ui.clip_rect();
+            let first = (((clip.top() - top) / pitch).floor().max(0.0) as usize).min(files.len());
+            let last = (((clip.bottom() - top) / pitch).ceil().max(0.0) as usize).clamp(first, files.len());
+            if first > 0 {
+                ui.allocate_space(egui::vec2(ui.available_width(), first as f32 * pitch - spacing));
+            }
+            for path in &files[first..last] {
                 let selected = self.selection.contains(path);
                 let (resp, mut p) = row(ui, selected, true);
                 p.indent(18.0);
@@ -1226,6 +1266,9 @@ impl RepoTab {
                     }
                     self.file_menu(ui, &pth, actions);
                 });
+            }
+            if last < files.len() {
+                ui.allocate_space(egui::vec2(ui.available_width(), (files.len() - last) as f32 * pitch - spacing));
             }
             ui.add_space(6.0);
         }
@@ -1608,14 +1651,14 @@ impl RepoTab {
             }
         });
         ui.add_space(4.0);
-        let mut locks = self.locks.clone();
-        locks.sort_by(|a, b| b.ours.cmp(&a.ours).then(a.path.cmp(&b.path)));
-        if locks.is_empty() {
+        if self.locks.is_empty() {
             ui.label(theme::small("No files are checked out by anyone."));
         }
-        egui::ScrollArea::vertical().id_salt("locks_scroll").auto_shrink([false, false]).show(ui, |ui| {
+        let total = self.locks.len();
+        egui::ScrollArea::vertical().id_salt("locks_scroll").auto_shrink([false, false]).show_rows(ui, ROW_H, total, |ui, range| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            for l in locks {
+            let visible: Vec<crate::git::lfs::Lock> = self.locks[range].to_vec();
+            for l in visible {
                 let (resp, mut p) = row(ui, self.selection.contains(&l.path), false);
                 p.text(icon::LOCK, Some(if l.ours { ACCENT } else { RED }));
                 p.right_text(&l.locked_at.chars().take(16).collect::<String>().replace('T', " "), MUTED);
