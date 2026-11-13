@@ -55,15 +55,6 @@ impl RowPainter {
         r
     }
 
-    /// Draws text in a fixed-width column as wide as `sample` would be, so what follows lines up across rows.
-    pub fn column(&mut self, s: &str, color: Color32, sample: &str) -> Rect {
-        let width = self.painter.layout_no_wrap(sample.to_string(), self.font.clone(), color).size().x;
-        let start = self.x;
-        let r = self.painter.text(egui::pos2(start, self.rect.center().y), Align2::LEFT_CENTER, s, self.font.clone(), color);
-        self.x = start + width.max(r.width()) + 10.0;
-        r
-    }
-
     pub fn italic(&mut self, s: &str, color: Color32) -> Rect {
         let galley = self.painter.layout_no_wrap(s.to_string(), self.font.clone(), color);
         let pos = egui::pos2(self.x, self.rect.center().y - galley.size().y / 2.0);
@@ -99,16 +90,6 @@ impl RowPainter {
 
     pub fn right_edge(&self) -> f32 {
         self.right
-    }
-
-    /// Small rounded label (branch/tag decorations).
-    pub fn pill(&mut self, s: &str, color: Color32) {
-        let galley = self.painter.layout_no_wrap(s.to_string(), FontId::proportional(11.5), Color32::WHITE);
-        let size = galley.size() + egui::vec2(10.0, 4.0);
-        let rect = Rect::from_min_size(egui::pos2(self.x, self.rect.center().y - size.y / 2.0), size);
-        self.painter.rect_filled(rect, 4.0, color.gamma_multiply(0.85));
-        self.painter.galley(rect.min + egui::vec2(5.0, 2.0), galley, Color32::WHITE);
-        self.x = rect.right() + 5.0;
     }
 }
 

@@ -64,7 +64,10 @@ remotes, stashes, cherry-pick and "back out this change" (revert commit).
   changes once uploaded. A change you haven't uploaded yet can get a new number if Get Latest puts it on top of newer
   work, much like P4V renumbers on submit. Search History by `42`, `#42` or `CL 42`. The Git commit id is still in the
   tooltip, the right-click menu and the details panel.
-* **History** with a lane graph, branch/tag labels, commit details and per-file diffs. Right-click a change to create a
+* **History** as a table with **CL #**, **Description**, **Author** and **Date** columns. Click a column title to sort by
+  it and click again to flip the direction. Columns can be resized and remember their widths. The branch graph shows
+  in the default newest-first view, and **Reset view** clears the search and sorting and restores it. Branch/tag labels,
+  commit details and per-file diffs are all there. Right-click a change to create a
   branch or tag, back it out, cherry-pick it, or undo your last unpushed commit while keeping its changes. You can also
   restore any older revision of a single file.
 * **Banners for common mistakes:** detached HEAD, missing name/email, unpushed commits, branches that only exist

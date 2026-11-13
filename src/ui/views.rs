@@ -1,12 +1,12 @@
 //! Main panels of a repository tab.
 
-use super::tab::{Action, CenterTab, DiffTarget, LeftTab, RepoTab, SwitchTarget};
+use super::tab::{Action, CenterTab, DiffTarget, HistoryColumn, LeftTab, RepoTab, SwitchTarget};
 use super::theme::{self, icon, ACCENT, GREEN, MUTED, ORANGE, PURPLE, RED, YELLOW};
 use super::tree::TreeFilter;
 use super::widgets::{self, row, DraggedFiles, ROW_H};
 use crate::changelists::DEFAULT_ID;
 use crate::git::branches::RefKind;
-use crate::git::history::HistoryScope;
+use crate::git::history::{GraphRow, HistoryScope};
 use crate::git::ops::Side;
 use crate::git::status::{ChangeKind, FileStatus, RepoOp, StatusSnapshot};
 use crate::git::CmdLog;
@@ -1233,6 +1233,7 @@ impl RepoTab {
 
     fn history_view(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let mut reload = false;
+        let rows = self.history_rows();
         ui.horizontal(|ui| {
             let label = match &self.history_scope {
                 HistoryScope::Current => "This branch".to_string(),
@@ -1255,15 +1256,37 @@ impl RepoTab {
                 self.history_scope = HistoryScope::Current;
                 reload = true;
             }
-            ui.add(
+            let search = ui.add(
                 egui::TextEdit::singleline(&mut self.history_filter)
                     .hint_text("🔍 Search description, author or CL #")
                     .desired_width(260.0),
             );
+            if search.changed() {
+                ui.ctx().request_repaint();
+            }
+            if ui
+                .button(format!("{} Reset view", icon::REVERT))
+                .on_hover_text("Clear the search, show newest changes first with the branch graph, and restore column widths")
+                .clicked()
+            {
+                self.history_filter.clear();
+                self.history_sort = None;
+                self.history_reset_columns = true;
+                if self.history_scope != HistoryScope::Current {
+                    self.history_scope = HistoryScope::Current;
+                    reload = true;
+                }
+                ui.ctx().request_repaint();
+            }
             if self.history_loading {
                 ui.add(egui::Spinner::new());
             }
-            ui.label(theme::small(format!("{} change(s)", self.history.len())));
+            let total = self.history.len();
+            let count = if rows.len() == total { format!("{total} change(s)") } else { format!("{} of {total} change(s)", rows.len()) };
+            ui.label(theme::small(count));
+            if let Some((col, asc)) = self.history_sort {
+                ui.label(theme::small(format!("· sorted by {} ({})", col.title(), if asc { "ascending" } else { "descending" })));
+            }
         });
         if reload {
             self.request_history();
@@ -1275,96 +1298,122 @@ impl RepoTab {
             ui.label(theme::small("No submitted changes yet."));
             return;
         }
-        let filter = self.history_filter.trim().to_lowercase();
-        // "42", "#42", "cl 42" and "CL #42" all find changelist 42.
-        let cl_query: Option<u64> = filter.trim_start_matches("cl").trim().trim_start_matches('#').trim().parse().ok();
-        let visible: Vec<usize> = (0..self.history.len())
-            .filter(|&i| {
-                let c = &self.history[i];
-                filter.is_empty()
-                    || cl_query.is_some_and(|n| c.cl == n)
-                    || c.subject.to_lowercase().contains(&filter)
-                    || c.author.to_lowercase().contains(&filter)
-                    || (filter.len() >= 4 && c.id.starts_with(&filter))
-            })
-            .collect();
-        let show_graph = filter.is_empty();
+        let visible = rows;
+        if visible.is_empty() {
+            ui.add_space(12.0);
+            ui.label(theme::small("No changes match the search."));
+            return;
+        }
+        // The branch graph only makes sense in history order with nothing hidden.
+        let show_graph = self.history_filter.trim().is_empty() && self.history_sort.is_none();
         let max_lanes = if show_graph { self.graph.iter().map(|g| g.width).max().unwrap_or(1).min(12) } else { 0 };
         let lane_w = 14.0;
         let graph_w = max_lanes as f32 * lane_w + 8.0;
-        // Every changelist label is padded to the widest one so descriptions line up.
-        let max_label = visible.iter().map(|&i| self.history[i].cl_label().len()).max().unwrap_or(0);
-        let cl_sample = "8".repeat(max_label);
         let head = self.status.as_ref().and_then(|s| s.branch.oid.clone());
         let ahead = self.status.as_ref().map(|s| s.branch.ahead).unwrap_or(0);
         let has_upstream = self.status.as_ref().is_some_and(|s| s.branch.upstream.is_some());
-        egui::ScrollArea::vertical().id_salt("history_scroll").auto_shrink([false, false]).show_rows(
-            ui,
-            ROW_H,
-            visible.len(),
-            |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                for &i in &visible[range] {
-                    let c = self.history[i].clone();
-                    let selected = self.selected_commit.as_deref() == Some(c.id.as_str());
-                    let (resp, mut p) = row(ui, selected, false);
+
+        // No vertical gap between rows, so the graph lines join up.
+        ui.spacing_mut().item_spacing.y = 0.0;
+        // With and without the graph column are separate layouts, each remembering its own column widths.
+        let (salt, other_salt) =
+            if show_graph { ("history_table_graph", "history_table") } else { ("history_table", "history_table_graph") };
+        let reset_columns = std::mem::take(&mut self.history_reset_columns);
+        if reset_columns {
+            egui_extras::TableBuilder::new(ui).id_salt(other_salt).reset();
+        }
+        let mut table = egui_extras::TableBuilder::new(ui)
+            .id_salt(salt)
+            .striped(true)
+            .resizable(true)
+            .sense(egui::Sense::click())
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .auto_shrink([false, false]);
+        if reset_columns {
+            table.reset();
+        }
+        if show_graph {
+            table = table.column(egui_extras::Column::exact(graph_w).resizable(false));
+        }
+        let table = table
+            .column(egui_extras::Column::initial(72.0).at_least(56.0).clip(true))
+            .column(egui_extras::Column::remainder().at_least(160.0).clip(true))
+            .column(egui_extras::Column::initial(150.0).at_least(70.0).clip(true))
+            .column(egui_extras::Column::initial(120.0).at_least(80.0).clip(true));
+
+        let mut sort = self.history_sort;
+        table
+            .header(24.0, |mut header| {
+                if show_graph {
+                    // The graph column has no title; it's hidden while sorting or searching.
+                    header.col(|_| {});
+                }
+                for (col, title) in [
+                    (HistoryColumn::Cl, "CL #"),
+                    (HistoryColumn::Description, "Description"),
+                    (HistoryColumn::Author, "Author"),
+                    (HistoryColumn::Date, "Date"),
+                ] {
+                    header.col(|ui| sort_header(ui, title, col, &mut sort));
+                }
+            })
+            .body(|body| {
+                body.rows(ROW_H, visible.len(), |mut row| {
+                    let i = visible[row.index()];
+                    let c = &self.history[i];
+                    let is_head = head.as_deref() == Some(c.id.as_str());
+                    row.set_selected(self.selected_commit.as_deref() == Some(c.id.as_str()));
+                    let mut cells = Vec::with_capacity(5);
                     if show_graph {
-                        if let Some(g) = self.graph.get(i) {
-                            let x0 = p.rect.left() + 8.0;
-                            let col_x = |c: usize| x0 + (c.min(11) as f32) * lane_w;
-                            let top = p.rect.top();
-                            let mid = p.rect.center().y;
-                            let bot = p.rect.bottom();
-                            for (a, b) in &g.up {
-                                p.painter.line_segment(
-                                    [egui::pos2(col_x(*a), top), egui::pos2(col_x(*b), mid)],
-                                    egui::Stroke::new(2.0, theme::lane_color(*a)),
-                                );
-                            }
-                            for (a, b) in &g.down {
-                                p.painter.line_segment(
-                                    [egui::pos2(col_x(*a), mid), egui::pos2(col_x(*b), bot)],
-                                    egui::Stroke::new(2.0, theme::lane_color(*b)),
-                                );
-                            }
-                            let is_head = head.as_deref() == Some(c.id.as_str());
-                            let color = theme::lane_color(g.node);
-                            if is_head {
-                                p.painter.circle_filled(egui::pos2(col_x(g.node), mid), 5.5, ui.visuals().panel_fill);
-                                p.painter.circle_stroke(egui::pos2(col_x(g.node), mid), 5.0, egui::Stroke::new(2.5, color));
-                            } else {
-                                p.painter.circle_filled(egui::pos2(col_x(g.node), mid), 4.5, color);
-                            }
-                        }
-                        p.indent(graph_w);
+                        cells.push(
+                            row.col(|ui| {
+                                if let Some(g) = self.graph.get(i) {
+                                    paint_graph_cell(ui, g, lane_w, is_head);
+                                }
+                            })
+                            .1,
+                        );
                     }
-                    // Changelist number column (P4V's "Change" column); the Git id is in the tooltip and menu.
-                    p.column(&c.cl_label(), MUTED, &cl_sample);
-                    for r in c.refs.iter().filter(|r| !r.ends_with("/HEAD")) {
-                        let (label, color) = if let Some(b) = r.strip_prefix("HEAD -> ") {
-                            (b.to_string(), GREEN)
-                        } else if let Some(t) = r.strip_prefix("tag: ") {
-                            (format!("{} {t}", icon::TAG), ORANGE)
-                        } else if r == "HEAD" {
-                            ("HEAD".to_string(), GREEN)
-                        } else if r.contains('/') {
-                            (r.clone(), ACCENT)
-                        } else {
-                            (r.clone(), PURPLE)
-                        };
-                        p.pill(&label, color);
-                    }
-                    let date = theme::format_time(c.time);
-                    p.right_text(&date, MUTED);
-                    let author_r = p.right_text(&c.author, MUTED);
-                    let limit = author_r.left() - 12.0;
-                    p.text_clipped(&c.subject, None, limit);
-                    let resp = resp.on_hover_text(format!(
-                        "{} \u{2014} {}\n{} <{}>\nGit commit {}",
+                    cells.push(
+                        row.col(|ui| {
+                            cell_text(ui, RichText::new(c.cl_label()).color(MUTED));
+                        })
+                        .1,
+                    );
+                    cells.push(
+                        row.col(|ui| {
+                            for r in c.refs.iter().filter(|r| !r.ends_with("/HEAD")) {
+                                let (label, color) = ref_style(r);
+                                ref_pill(ui, &label, color);
+                            }
+                            cell_text(ui, c.subject.as_str());
+                        })
+                        .1,
+                    );
+                    cells.push(
+                        row.col(|ui| {
+                            cell_text(ui, RichText::new(&c.author).color(MUTED));
+                        })
+                        .1,
+                    );
+                    cells.push(
+                        row.col(|ui| {
+                            cell_text(ui, RichText::new(theme::format_time(c.time)).color(MUTED));
+                        })
+                        .1,
+                    );
+
+                    // The tooltip lives on the Description cell: on the whole row's combined response it got in the
+                    // way of clicks once it appeared.
+                    let desc_cell = cells[if show_graph { 2 } else { 1 }].clone();
+                    let resp = row.response();
+                    let _ = desc_cell.on_hover_text(format!(
+                        "{} \u{2014} {}\n{} <{}>\n{}\nGit commit {}",
                         c.cl_label(),
                         c.subject,
                         c.author,
                         c.email,
+                        theme::format_time(c.time),
                         c.id
                     ));
                     if resp.clicked() {
@@ -1373,7 +1422,6 @@ impl RepoTab {
                     let id = c.id.clone();
                     let cl = c.cl;
                     let is_merge = c.parents.len() > 1;
-                    let is_head = head.as_deref() == Some(c.id.as_str());
                     resp.context_menu(|ui| {
                         if cl > 0 && ui.button(format!("Copy changelist number ({cl})")).clicked() {
                             ui.ctx().copy_text(cl.to_string());
@@ -1384,16 +1432,16 @@ impl RepoTab {
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("New branch from here…").clicked() {
+                        if ui.button("New branch from here\u{2026}").clicked() {
                             actions.push(Action::NewBranch(Some(id.clone())));
                             ui.close();
                         }
-                        if ui.button(format!("{} New tag here…", icon::TAG)).clicked() {
+                        if ui.button(format!("{} New tag here\u{2026}", icon::TAG)).clicked() {
                             actions.push(Action::NewTag(id.clone()));
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("Back out this change…").on_hover_text("Create a new change that undoes this one").clicked() {
+                        if ui.button("Back out this change\u{2026}").on_hover_text("Create a new change that undoes this one").clicked() {
                             actions.push(Action::RevertCommit(id.clone(), is_merge));
                             ui.close();
                         }
@@ -1402,14 +1450,52 @@ impl RepoTab {
                             ui.close();
                         }
                         let can_undo = is_head && (ahead > 0 || !has_upstream);
-                        if can_undo && ui.button("Undo this commit (keep changes)…").clicked() {
+                        if can_undo && ui.button("Undo this commit (keep changes)\u{2026}").clicked() {
                             actions.push(Action::UndoLastCommit);
                             ui.close();
                         }
                     });
+                });
+            });
+        if sort != self.history_sort {
+            self.history_sort = sort;
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Indices into `history` that match the search, in display order.
+    fn history_rows(&self) -> Vec<usize> {
+        let filter = self.history_filter.trim().to_lowercase();
+        // "42", "#42", "cl 42" and "CL #42" all find changelist 42.
+        let cl_query: Option<u64> = filter.trim_start_matches("cl").trim().trim_start_matches('#').trim().parse().ok();
+        let mut visible: Vec<usize> = (0..self.history.len())
+            .filter(|&i| {
+                let c = &self.history[i];
+                filter.is_empty()
+                    || cl_query.is_some_and(|n| c.cl == n)
+                    || c.subject.to_lowercase().contains(&filter)
+                    || c.author.to_lowercase().contains(&filter)
+                    || (filter.len() >= 4 && c.id.starts_with(&filter))
+            })
+            .collect();
+        if let Some((col, ascending)) = self.history_sort {
+            let h = &self.history;
+            visible.sort_by(|&a, &b| {
+                let (a, b) = (&h[a], &h[b]);
+                let ord = match col {
+                    HistoryColumn::Cl => a.cl.cmp(&b.cl).then(a.time.cmp(&b.time)),
+                    HistoryColumn::Description => a.subject.to_lowercase().cmp(&b.subject.to_lowercase()).then(a.cl.cmp(&b.cl)),
+                    HistoryColumn::Author => a.author.to_lowercase().cmp(&b.author.to_lowercase()).then(a.time.cmp(&b.time)),
+                    HistoryColumn::Date => a.time.cmp(&b.time).then(a.cl.cmp(&b.cl)),
+                };
+                if ascending {
+                    ord
+                } else {
+                    ord.reverse()
                 }
-            },
-        );
+            });
+        }
+        visible
     }
 
     fn shelves_view(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -1611,4 +1697,84 @@ fn log_view(ui: &mut Ui, log: &CmdLog) {
             }
         }
     });
+}
+
+/// A clickable column title that sorts by that column; clicking again flips the direction.
+fn sort_header(ui: &mut Ui, title: &str, col: HistoryColumn, sort: &mut Option<(HistoryColumn, bool)>) {
+    let active = sort.filter(|(c, _)| *c == col).map(|(_, asc)| asc);
+    let arrow = match active {
+        Some(true) => " ⏶",
+        Some(false) => " ⏷",
+        None => "",
+    };
+    let text = RichText::new(format!("{title}{arrow}")).strong();
+    let text = if active.is_some() { text.color(ACCENT) } else { text };
+    let tip = match active {
+        Some(true) => format!("Sorted by {title}, ascending. Click for descending."),
+        Some(false) => format!("Sorted by {title}, descending. Click for ascending."),
+        None => format!("Sort by {title}"),
+    };
+    // The whole header cell is the click target, not just the words.
+    let rect = ui.max_rect();
+    let resp = ui.interact(rect, ui.scope_id().with(("sort_header", title)), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 2.0, ui.visuals().widgets.hovered.weak_bg_fill);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.label(text);
+    let resp = resp.on_hover_text(tip);
+    if resp.clicked() {
+        *sort = Some((col, active.map(|asc| !asc).unwrap_or(true)));
+    }
+}
+
+/// Draws one row of the branch graph into a table cell.
+fn paint_graph_cell(ui: &Ui, g: &GraphRow, lane_w: f32, is_head: bool) {
+    let rect = ui.max_rect();
+    let painter = ui.painter();
+    let x0 = rect.left() + 8.0;
+    let col_x = |c: usize| x0 + (c.min(11) as f32) * lane_w;
+    let (top, mid, bot) = (rect.top(), rect.center().y, rect.bottom());
+    for (a, b) in &g.up {
+        painter.line_segment([egui::pos2(col_x(*a), top), egui::pos2(col_x(*b), mid)], egui::Stroke::new(2.0, theme::lane_color(*a)));
+    }
+    for (a, b) in &g.down {
+        painter.line_segment([egui::pos2(col_x(*a), mid), egui::pos2(col_x(*b), bot)], egui::Stroke::new(2.0, theme::lane_color(*b)));
+    }
+    let color = theme::lane_color(g.node);
+    let center = egui::pos2(col_x(g.node), mid);
+    if is_head {
+        painter.circle_filled(center, 5.5, ui.visuals().panel_fill);
+        painter.circle_stroke(center, 5.0, egui::Stroke::new(2.5, color));
+    } else {
+        painter.circle_filled(center, 4.5, color);
+    }
+}
+
+/// Label and color for a branch/tag decoration.
+fn ref_style(r: &str) -> (String, Color32) {
+    if let Some(b) = r.strip_prefix("HEAD -> ") {
+        (b.to_string(), GREEN)
+    } else if let Some(t) = r.strip_prefix("tag: ") {
+        (format!("{} {t}", icon::TAG), ORANGE)
+    } else if r == "HEAD" {
+        ("HEAD".to_string(), GREEN)
+    } else if r.contains('/') {
+        (r.to_string(), ACCENT)
+    } else {
+        (r.to_string(), PURPLE)
+    }
+}
+
+/// Small rounded branch/tag label inside a table cell.
+fn ref_pill(ui: &mut Ui, label: &str, color: Color32) {
+    egui::Frame::new().fill(color.gamma_multiply(0.85)).corner_radius(4).inner_margin(egui::Margin::symmetric(5, 1)).show(ui, |ui| {
+        cell_text(ui, RichText::new(label).size(11.5).color(Color32::WHITE));
+    });
+}
+
+/// Text inside a History table cell. It only senses hover (for the "full text" tooltip when truncated), so clicks
+/// and right-clicks always reach the row. A plain label would be click-and-drag selectable and swallow them.
+fn cell_text(ui: &mut Ui, text: impl Into<egui::WidgetText>) {
+    ui.add(egui::Label::new(text).truncate().selectable(false).sense(egui::Sense::hover()));
 }

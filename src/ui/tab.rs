@@ -54,6 +54,26 @@ pub struct DiffData {
     pub new_size: Option<u64>,
 }
 
+/// Sortable columns of the History table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryColumn {
+    Cl,
+    Description,
+    Author,
+    Date,
+}
+
+impl HistoryColumn {
+    pub fn title(self) -> &'static str {
+        match self {
+            HistoryColumn::Cl => "CL #",
+            HistoryColumn::Description => "Description",
+            HistoryColumn::Author => "Author",
+            HistoryColumn::Date => "Date",
+        }
+    }
+}
+
 pub enum OpOk {
     Message(String),
     Sync(SyncOutcome),
@@ -300,6 +320,10 @@ pub struct RepoTab {
     pub graph: Vec<GraphRow>,
     pub history_scope: HistoryScope,
     pub history_filter: String,
+    /// History table sort: column and ascending? `None` = history order with the branch graph.
+    pub history_sort: Option<(HistoryColumn, bool)>,
+    /// Set by "Reset view" to restore the default column widths on the next frame.
+    pub history_reset_columns: bool,
     history_gen: u64,
     pub history_loading: bool,
     pub history_err: Option<String>,
@@ -382,6 +406,8 @@ impl RepoTab {
             graph: Vec::new(),
             history_scope: HistoryScope::Current,
             history_filter: String::new(),
+            history_sort: None,
+            history_reset_columns: false,
             history_gen: 0,
             history_loading: false,
             history_err: None,
