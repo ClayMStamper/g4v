@@ -1025,43 +1025,49 @@ impl RepoTab {
             let collapsed = self.collapsed_cls.contains(&id);
             let n_changed = files.iter().filter(|p| self.file(p).is_some()).count();
             let title = if id == DEFAULT_ID { "Default changelist".to_string() } else { format!("#{id}  {}", self.changelist_name(id)) };
-            let header = egui::Frame::new()
-                .fill(ui.visuals().faint_bg_color)
-                .corner_radius(4)
-                .inner_margin(egui::Margin::symmetric(6, 3))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        if ui.small_button(if collapsed { "⏵" } else { "⏷" }).clicked() {
-                            if collapsed {
-                                self.collapsed_cls.remove(&id);
-                            } else {
-                                self.collapsed_cls.insert(id);
-                            }
-                        }
-                        ui.label(RichText::new(title).strong());
-                        ui.label(theme::small(format!("{} file(s)", files.len())));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if id != DEFAULT_ID && ui.small_button("✏").on_hover_text("Edit description").clicked() {
-                                actions.push(Action::EditChangelist(id));
-                            }
-                            if ui.add_enabled(n_changed > 0, egui::Button::new(format!("{} Shelve", icon::SHELVE)).small()).clicked() {
-                                actions.push(Action::OpenShelve(files.clone(), Some(id)));
-                            }
-                            if ui
-                                .add_enabled(
-                                    n_changed > 0 && !self.is_busy(),
-                                    egui::Button::new(RichText::new(format!("{} Submit…", icon::SUBMIT)).strong()).small(),
-                                )
-                                .clicked()
-                            {
-                                actions.push(Action::OpenSubmit(id));
-                            }
-                        });
-                    });
+            // The click sense is attached to the header's own Ui *before* its buttons are added, so the buttons sit on
+            // top and receive their clicks; the header only gets clicks (context menu, drops) that miss them.
+            let header = ui
+                .scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+                    egui::Frame::new().fill(ui.visuals().faint_bg_color).corner_radius(4).inner_margin(egui::Margin::symmetric(6, 3)).show(
+                        ui,
+                        |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                if ui.small_button(if collapsed { "⏵" } else { "⏷" }).clicked() {
+                                    if collapsed {
+                                        self.collapsed_cls.remove(&id);
+                                    } else {
+                                        self.collapsed_cls.insert(id);
+                                    }
+                                }
+                                ui.label(RichText::new(title).strong());
+                                ui.label(theme::small(format!("{} file(s)", files.len())));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if id != DEFAULT_ID && ui.small_button("✏").on_hover_text("Edit description").clicked() {
+                                        actions.push(Action::EditChangelist(id));
+                                    }
+                                    if ui
+                                        .add_enabled(n_changed > 0, egui::Button::new(format!("{} Shelve", icon::SHELVE)).small())
+                                        .clicked()
+                                    {
+                                        actions.push(Action::OpenShelve(files.clone(), Some(id)));
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            n_changed > 0 && !self.is_busy(),
+                                            egui::Button::new(RichText::new(format!("{} Submit…", icon::SUBMIT)).strong()).small(),
+                                        )
+                                        .clicked()
+                                    {
+                                        actions.push(Action::OpenSubmit(id));
+                                    }
+                                });
+                            });
+                        },
+                    )
                 })
                 .response;
-            let header = header.interact(egui::Sense::click());
             if let Some(payload) = header.dnd_release_payload::<DraggedFiles>() {
                 actions.push(Action::MoveFiles(payload.0.clone(), id));
             }

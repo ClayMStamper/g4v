@@ -18,4 +18,12 @@ fn main() {
         .unwrap_or_else(|| "0.0.0".into());
     println!("cargo:rustc-env=G4V_VERSION={version}");
     println!("cargo:rerun-if-changed={}", root.join("Cargo.toml").display());
+
+    // Give the setup program the g4v icon too.
+    let ico = root.join("assets").join("g4v.ico").canonicalize().unwrap();
+    println!("cargo:rerun-if-changed={}", ico.display());
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon(ico.to_str().unwrap());
+    res.set("FileDescription", "g4v Setup");
+    res.compile().expect("failed to embed the Windows icon resource");
 }

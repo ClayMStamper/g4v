@@ -9,7 +9,8 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("g4v")
             .with_inner_size([1400.0, 880.0])
-            .with_min_inner_size([900.0, 560.0]),
+            .with_min_inner_size([900.0, 560.0])
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/g4v.png")).unwrap_or_default()),
         persist_window: true,
         ..Default::default()
     };

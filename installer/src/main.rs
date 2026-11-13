@@ -336,7 +336,8 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_title(if uninstall_mode { "Uninstall g4v" } else { "g4v Setup" })
             .with_inner_size([520.0, 380.0])
-            .with_resizable(false),
+            .with_resizable(false)
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../../assets/g4v.png")).unwrap_or_default()),
         ..Default::default()
     };
     let _ = eframe::run_native("g4v-setup", native, Box::new(|_| Ok(Box::new(app))));
