@@ -110,6 +110,17 @@ cargo run --release
 cargo run --release -- path/to/repo another/repo
 ```
 
+### Windows installer
+
+```powershell
+powershell -ExecutionPolicy Bypass -File installer\build.ps1
+```
+
+This produces `dist\g4v-setup-<version>.exe`, a single self-contained installer. It installs per user into
+`%LOCALAPPDATA%\Programs\g4v` (no administrator rights), adds Start menu and desktop shortcuts, and registers g4v in
+*Settings › Apps* so it can be uninstalled normally. Unattended use: `g4v-setup.exe --silent [--dir PATH]` and
+`uninstall.exe --uninstall --silent`. Uninstalling never touches your repositories or g4v settings.
+
 To make binary files lockable (Perforce-style exclusive check-out):
 
 ```bash

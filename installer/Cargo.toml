@@ -1,0 +1,18 @@
+[package]
+name = "g4v-setup"
+version = "0.1.0"
+edition = "2021"
+description = "Windows installer for g4v"
+license = "MIT"
+publish = false
+
+# Standalone crate (not part of the main build): it embeds the already-built
+# release binary of g4v. Build it with installer/build.ps1.
+[workspace]
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
