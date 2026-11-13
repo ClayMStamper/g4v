@@ -8,7 +8,7 @@ use crate::changelists::DEFAULT_ID;
 use crate::git::branches::RefKind;
 use crate::git::history::HistoryScope;
 use crate::git::ops::Side;
-use crate::git::status::{ChangeKind, FileStatus, RepoOp};
+use crate::git::status::{ChangeKind, FileStatus, RepoOp, StatusSnapshot};
 use crate::git::CmdLog;
 use crate::settings::Settings;
 use eframe::egui::{self, Color32, RichText, Ui};
@@ -938,28 +938,68 @@ impl RepoTab {
         ui.add_space(4.0);
         let modifiers = ui.input(|i| i.modifiers);
         egui::ScrollArea::vertical().id_salt("pending_scroll").auto_shrink([false, false]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 1.0;
-            // Conflicts first.
-            let conflicts: Vec<FileStatus> = st.conflicts().cloned().collect();
-            if !conflicts.is_empty() || st.op != RepoOp::None {
-                self.conflicts_section(ui, &conflicts, st.op, actions);
-                ui.add_space(8.0);
+            // The whole list area is a background target for clicks that miss every row and header (they're added
+            // afterwards, so they sit on top): left-click clears the selection, right-click opens the panel menu.
+            let background = ui
+                .scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+                    ui.set_min_height(ui.available_height());
+                    self.pending_list(ui, &st, modifiers, actions);
+                })
+                .response;
+            if background.clicked() && !self.selection.is_empty() {
+                self.selection.clear();
+                self.clear_diff();
             }
-            let mut ids = vec![DEFAULT_ID];
-            ids.extend(self.changelists.lists.iter().map(|c| c.id));
-            // Order of all visible files for shift-selection.
-            let order: Vec<String> = ids.iter().flat_map(|id| self.cl_files(*id)).collect();
-            if order.is_empty() && conflicts.is_empty() {
-                ui.add_space(30.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new(format!("{} No pending changes", icon::OK)).size(18.0).color(GREEN));
-                    ui.label(theme::small("Edit, add or delete files in your workspace folder and they'll appear here automatically."));
-                });
-            }
-            for id in ids {
-                self.changelist_section(ui, id, &order, modifiers, actions);
-            }
+            background.context_menu(|ui| self.pending_background_menu(ui, actions));
         });
+    }
+
+    /// Context menu for empty space in the Pending panel (P4V-style).
+    fn pending_background_menu(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        if ui.button("✚ New changelist…").clicked() {
+            actions.push(Action::NewChangelist(Vec::new()));
+            ui.close();
+        }
+        ui.separator();
+        let any_lists = !self.changelists.lists.is_empty() || !self.cl_files(DEFAULT_ID).is_empty();
+        if ui.add_enabled(any_lists, egui::Button::new("Expand all")).clicked() {
+            self.collapsed_cls.clear();
+            ui.close();
+        }
+        if ui.add_enabled(any_lists, egui::Button::new("Collapse all")).clicked() {
+            self.collapsed_cls.insert(DEFAULT_ID);
+            self.collapsed_cls.extend(self.changelists.lists.iter().map(|c| c.id));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button(format!("{} Refresh", icon::REFRESH)).clicked() {
+            actions.push(Action::Refresh);
+            ui.close();
+        }
+    }
+
+    fn pending_list(&mut self, ui: &mut Ui, st: &StatusSnapshot, modifiers: egui::Modifiers, actions: &mut Vec<Action>) {
+        ui.spacing_mut().item_spacing.y = 1.0;
+        // Conflicts first.
+        let conflicts: Vec<FileStatus> = st.conflicts().cloned().collect();
+        if !conflicts.is_empty() || st.op != RepoOp::None {
+            self.conflicts_section(ui, &conflicts, st.op, actions);
+            ui.add_space(8.0);
+        }
+        let mut ids = vec![DEFAULT_ID];
+        ids.extend(self.changelists.lists.iter().map(|c| c.id));
+        // Order of all visible files for shift-selection.
+        let order: Vec<String> = ids.iter().flat_map(|id| self.cl_files(*id)).collect();
+        if order.is_empty() && conflicts.is_empty() {
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(format!("{} No pending changes", icon::OK)).size(18.0).color(GREEN));
+                ui.label(theme::small("Edit, add or delete files in your workspace folder and they'll appear here automatically."));
+            });
+        }
+        for id in ids {
+            self.changelist_section(ui, id, &order, modifiers, actions);
+        }
     }
 
     fn conflicts_section(&mut self, ui: &mut Ui, conflicts: &[FileStatus], op: RepoOp, actions: &mut Vec<Action>) {
