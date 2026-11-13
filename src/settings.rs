@@ -1,0 +1,77 @@
+//! Application settings stored as JSON in the user's config directory.
+
+use crate::git::ops::PullMode;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Settings {
+    /// Repositories open as tabs (restored on start).
+    pub open_repos: Vec<PathBuf>,
+    pub active_repo: usize,
+    pub recent_repos: Vec<PathBuf>,
+    /// How often to check the server for new changes (0 = never).
+    pub fetch_interval_secs: u64,
+    /// Release LFS locks on files after they are submitted.
+    pub unlock_after_submit: bool,
+    pub pull_mode: PullMode,
+    /// Warn when adding files larger than this that are not stored in LFS.
+    pub large_file_mb: u64,
+    pub dark_mode: bool,
+    /// Remove automatic backup shelves after this many days (0 = keep forever).
+    pub backup_retention_days: i64,
+    /// Push right after committing (Perforce-style "Submit").
+    pub push_on_submit: bool,
+    pub ui_scale: f32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            open_repos: Vec::new(),
+            active_repo: 0,
+            recent_repos: Vec::new(),
+            fetch_interval_secs: 180,
+            unlock_after_submit: true,
+            pull_mode: PullMode::Rebase,
+            large_file_mb: 25,
+            dark_mode: true,
+            backup_retention_days: 30,
+            push_on_submit: true,
+            ui_scale: 1.0,
+        }
+    }
+}
+
+impl Settings {
+    pub fn path() -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join("g4v").join("settings.json"))
+    }
+
+    pub fn load() -> Settings {
+        Self::path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let Some(p) = Self::path() else { return };
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(self) {
+            let tmp = p.with_extension("json.tmp");
+            if std::fs::write(&tmp, text).is_ok() {
+                let _ = std::fs::rename(tmp, p);
+            }
+        }
+    }
+
+    pub fn add_recent(&mut self, p: PathBuf) {
+        self.recent_repos.retain(|r| r != &p);
+        self.recent_repos.insert(0, p);
+        self.recent_repos.truncate(12);
+    }
+}
