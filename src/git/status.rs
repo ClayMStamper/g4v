@@ -101,6 +101,8 @@ pub struct StatusSnapshot {
     pub op: RepoOp,
     /// `.git/index.lock` exists (a crashed git process, or one running right now).
     pub index_lock: bool,
+    /// The branch being rebased (HEAD is detached while a rebase is in progress).
+    pub rebase_branch: Option<String>,
 }
 
 impl StatusSnapshot {
@@ -182,15 +184,7 @@ pub fn parse_porcelain_v2(bytes: &[u8]) -> (BranchStatus, Vec<FileStatus>, u32) 
             }
             Some('?') => {
                 let path = line[2.min(line.len())..].to_string();
-                files.push(FileStatus {
-                    path,
-                    orig_path: None,
-                    kind: ChangeKind::Add,
-                    x: '?',
-                    y: '?',
-                    untracked: true,
-                    submodule: false,
-                });
+                files.push(FileStatus { path, orig_path: None, kind: ChangeKind::Add, x: '?', y: '?', untracked: true, submodule: false });
             }
             _ => {}
         }
@@ -217,15 +211,7 @@ fn ordinary(xy: &str, sub: &str, path: String, orig: Option<String>) -> FileStat
     } else {
         ChangeKind::Edit
     };
-    FileStatus {
-        path,
-        orig_path: orig,
-        kind,
-        x,
-        y,
-        untracked: false,
-        submodule: sub.starts_with('S'),
-    }
+    FileStatus { path, orig_path: orig, kind, x, y, untracked: false, submodule: sub.starts_with('S') }
 }
 
 impl Repo {
@@ -252,6 +238,14 @@ impl Repo {
             stash_count,
             op: self.current_op(),
             index_lock: self.git_dir().join("index.lock").exists(),
+            rebase_branch: self.rebase_branch(),
+        })
+    }
+
+    fn rebase_branch(&self) -> Option<String> {
+        ["rebase-merge", "rebase-apply"].iter().find_map(|d| {
+            let s = std::fs::read_to_string(self.git_dir().join(d).join("head-name")).ok()?;
+            Some(s.trim().trim_start_matches("refs/heads/").to_string())
         })
     }
 

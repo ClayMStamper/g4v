@@ -32,12 +32,7 @@ fn isolate() {
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git").current_dir(dir).args(args).output().expect("git runs");
-    assert!(
-        out.status.success(),
-        "git {:?} failed: {}",
-        args,
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 

@@ -40,13 +40,7 @@ struct Verified {
 }
 
 fn convert(r: RawLock, ours: bool) -> Lock {
-    Lock {
-        id: r.id,
-        path: r.path,
-        owner: r.owner.map(|o| o.name).unwrap_or_default(),
-        locked_at: r.locked_at,
-        ours,
-    }
+    Lock { id: r.id, path: r.path, owner: r.owner.map(|o| o.name).unwrap_or_default(), locked_at: r.locked_at, ours }
 }
 
 /// Parses `git lfs locks --verify --json`.
@@ -146,33 +140,18 @@ impl Repo {
         if paths.is_empty() {
             return Ok(HashMap::new());
         }
-        let out = self
-            .git()
-            .args(["check-attr", "-z", "--stdin", attr])
-            .stdin_paths(paths)
-            .quiet()
-            .run()?;
+        let out = self.git().args(["check-attr", "-z", "--stdin", attr]).stdin_paths(paths).quiet().run()?;
         Ok(parse_check_attr(&out.stdout))
     }
 
     /// Paths marked `lockable` in .gitattributes.
     pub fn lockable_paths(&self, paths: &[String]) -> GitResult<HashSet<String>> {
-        Ok(self
-            .check_attr("lockable", paths)?
-            .into_iter()
-            .filter(|(_, v)| v == "set" || v == "true")
-            .map(|(k, _)| k)
-            .collect())
+        Ok(self.check_attr("lockable", paths)?.into_iter().filter(|(_, v)| v == "set" || v == "true").map(|(k, _)| k).collect())
     }
 
     /// Paths stored through Git LFS.
     pub fn lfs_tracked_paths(&self, paths: &[String]) -> GitResult<HashSet<String>> {
-        Ok(self
-            .check_attr("filter", paths)?
-            .into_iter()
-            .filter(|(_, v)| v == "lfs")
-            .map(|(k, _)| k)
-            .collect())
+        Ok(self.check_attr("filter", paths)?.into_iter().filter(|(_, v)| v == "lfs").map(|(k, _)| k).collect())
     }
 
     /// `git lfs track <pattern>` (optionally lockable). Edits .gitattributes.

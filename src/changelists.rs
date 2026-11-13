@@ -96,11 +96,7 @@ impl ChangelistStore {
 
     /// Which changelist a file belongs to.
     pub fn list_of(&self, path: &str) -> u32 {
-        self.lists
-            .iter()
-            .find(|l| l.files.contains(path))
-            .map(|l| l.id)
-            .unwrap_or(DEFAULT_ID)
+        self.lists.iter().find(|l| l.files.contains(path)).map(|l| l.id).unwrap_or(DEFAULT_ID)
     }
 
     /// Moves files into changelist `to` (0 = default).
@@ -132,11 +128,7 @@ impl ChangelistStore {
 
     /// Files of changelist `id` among `pending` (default list = everything unassigned).
     pub fn files_in<'a>(&self, id: u32, pending: impl IntoIterator<Item = &'a String>) -> Vec<String> {
-        pending
-            .into_iter()
-            .filter(|p| self.list_of(p) == id)
-            .cloned()
-            .collect()
+        pending.into_iter().filter(|p| self.list_of(p) == id).cloned().collect()
     }
 }
 

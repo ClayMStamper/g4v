@@ -45,15 +45,16 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// `G4V_CONFIG_DIR` overrides the location (useful for testing and portable installs).
     pub fn path() -> Option<PathBuf> {
+        if let Some(d) = std::env::var_os("G4V_CONFIG_DIR") {
+            return Some(PathBuf::from(d).join("settings.json"));
+        }
         dirs::config_dir().map(|d| d.join("g4v").join("settings.json"))
     }
 
     pub fn load() -> Settings {
-        Self::path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+        Self::path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
     }
 
     pub fn save(&self) {

@@ -157,9 +157,7 @@ pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 pub fn is_image_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tga", ".tif", ".tiff", ".webp"]
-        .iter()
-        .any(|e| lower.ends_with(e))
+    [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tga", ".tif", ".tiff", ".webp"].iter().any(|e| lower.ends_with(e))
 }
 
 impl Repo {
@@ -170,10 +168,7 @@ impl Repo {
             return Ok(added_file_diff(&bytes));
         }
         let base = if has_head { "HEAD" } else { EMPTY_TREE };
-        let mut cmd = self
-            .git()
-            .args(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M", base, "--"])
-            .arg(path);
+        let mut cmd = self.git().args(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M", base, "--"]).arg(path);
         if let Some(o) = orig {
             cmd = cmd.arg(o);
         }
@@ -183,13 +178,7 @@ impl Repo {
     /// Diff of a file between two revisions (`old` may be None for root commits).
     pub fn diff_revs(&self, old: Option<&str>, new: &str, path: &str, old_path: Option<&str>) -> GitResult<FileDiff> {
         let old = old.unwrap_or(EMPTY_TREE);
-        let mut cmd = self
-            .git()
-            .args(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M"])
-            .arg(old)
-            .arg(new)
-            .arg("--")
-            .arg(path);
+        let mut cmd = self.git().args(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M"]).arg(old).arg(new).arg("--").arg(path);
         if let Some(o) = old_path {
             cmd = cmd.arg(o);
         }

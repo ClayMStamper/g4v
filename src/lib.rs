@@ -6,4 +6,5 @@
 pub mod changelists;
 pub mod git;
 pub mod settings;
+pub mod ui;
 pub mod worker;

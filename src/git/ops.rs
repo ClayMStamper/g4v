@@ -32,11 +32,15 @@ pub enum PullMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncOutcome {
     UpToDate,
-    Updated { commits: u32 },
+    Updated {
+        commits: u32,
+    },
     /// The current branch has never been published.
     NoUpstream,
     /// Local edits touch files that were also changed on the server.
-    Blocked { overlap: Vec<String> },
+    Blocked {
+        overlap: Vec<String>,
+    },
     /// Merge/rebase stopped with conflicts that need resolving.
     Conflicts,
 }
@@ -89,14 +93,20 @@ impl Repo {
     /// Files changed on the upstream branch that are not in my HEAD yet
     /// ("not at latest revision" in Perforce terms).
     pub fn incoming_files(&self) -> GitResult<Vec<String>> {
-        let r = self
-            .git()
-            .args(["diff", "--no-ext-diff", "--name-only", "-z", "--no-renames", "HEAD...@{upstream}"])
-            .quiet()
-            .run();
+        Ok(self.incoming_changes()?.into_iter().map(|(_, p)| p).collect())
+    }
+
+    /// Like [`Self::incoming_files`] with the change letter (A/M/D/T).
+    pub fn incoming_changes(&self) -> GitResult<Vec<(char, String)>> {
+        let r = self.git().args(["diff", "--no-ext-diff", "--name-status", "-z", "--no-renames", "HEAD...@{upstream}"]).quiet().run();
         match r {
-            Ok(out) => Ok(super::split_nul(&out.stdout)),
-            Err(e) if e.stderr.contains("no upstream") || e.stderr.contains("unknown revision") || e.stderr.contains("ambiguous argument") => {
+            Ok(out) => Ok(super::history::parse_name_status(&out.stdout).into_iter().map(|f| (f.status, f.path)).collect()),
+            Err(e)
+                if e.stderr.contains("no upstream")
+                    || e.stderr.contains("unknown revision")
+                    || e.stderr.contains("ambiguous argument")
+                    || e.stderr.contains("bad revision") =>
+            {
                 Ok(Vec::new())
             }
             Err(e) => Err(e),
@@ -112,10 +122,7 @@ impl Repo {
         if paths.is_empty() {
             return Err(user_error("commit", "No files selected."));
         }
-        self.git()
-            .args(["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"])
-            .stdin_paths(paths)
-            .run()?;
+        self.git().args(["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"]).stdin_paths(paths).run()?;
         std::fs::create_dir_all(self.meta_dir()).ok();
         let msg_file = self.meta_dir().join("COMMIT_MSG");
         std::fs::write(&msg_file, message.trim().as_bytes())
@@ -142,9 +149,8 @@ impl Repo {
         let res = match (upstream_remote, upstream_merge) {
             (Some(remote), Some(merge)) => self.git().arg("push").arg(&remote).arg(format!("HEAD:{merge}")).run(),
             _ => {
-                let remote = self
-                    .default_remote()
-                    .ok_or_else(|| user_error("push", "This repository has no server (remote) configured."))?;
+                let remote =
+                    self.default_remote().ok_or_else(|| user_error("push", "This repository has no server (remote) configured."))?;
                 self.git().args(["push", "-u"]).arg(&remote).arg("HEAD").run()
             }
         };
@@ -205,10 +211,7 @@ impl Repo {
             }
         }
         if !submodules.is_empty() {
-            self.git()
-                .args(["submodule", "update", "--init", "--"])
-                .args(&submodules)
-                .run()?;
+            self.git().args(["submodule", "update", "--init", "--"]).args(&submodules).run()?;
         }
         Ok(())
     }
@@ -225,10 +228,7 @@ impl Repo {
             return Ok(SyncOutcome::NoUpstream);
         }
         if status.has_conflicts() || status.op != RepoOp::None {
-            return Err(user_error(
-                "sync",
-                "Finish resolving the current merge/rebase before getting latest.",
-            ));
+            return Err(user_error("sync", "Finish resolving the current merge/rebase before getting latest."));
         }
         let behind = status.branch.behind;
         if behind == 0 {
@@ -272,10 +272,7 @@ impl Repo {
         };
         let exists = if use_ours { f.conflict_ours_exists() } else { f.conflict_theirs_exists() };
         if exists {
-            self.git()
-                .args(["checkout", if use_ours { "--ours" } else { "--theirs" }, "--"])
-                .arg(&f.path)
-                .run()?;
+            self.git().args(["checkout", if use_ours { "--ours" } else { "--theirs" }, "--"]).arg(&f.path).run()?;
             self.git().args(["add", "--"]).arg(&f.path).run()?;
         } else {
             self.git().args(["rm", "-q", "-f", "--"]).arg(&f.path).run()?;
@@ -348,12 +345,7 @@ impl Repo {
 
     /// Writes `path` as it was in `rev` into the working copy ("Get Revision").
     pub fn restore_file_from(&self, rev: &str, path: &str) -> GitResult<()> {
-        self.git()
-            .args(["restore", "--worktree"])
-            .arg(format!("--source={rev}"))
-            .arg("--")
-            .arg(path)
-            .run()?;
+        self.git().args(["restore", "--worktree"]).arg(format!("--source={rev}")).arg("--").arg(path).run()?;
         Ok(())
     }
 
@@ -397,17 +389,7 @@ pub fn user_error(cmd: &str, msg: &str) -> GitError {
 
 /// Clones `url` into `dest` (including submodules and LFS content).
 pub fn clone(url: &str, dest: &Path, log: &CmdLog) -> GitResult<()> {
-    run_global(
-        &[
-            OsStr::new("clone"),
-            OsStr::new("--recurse-submodules"),
-            OsStr::new("--"),
-            OsStr::new(url),
-            dest.as_os_str(),
-        ],
-        None,
-        log,
-    )?;
+    run_global(&[OsStr::new("clone"), OsStr::new("--recurse-submodules"), OsStr::new("--"), OsStr::new(url), dest.as_os_str()], None, log)?;
     Ok(())
 }
 
@@ -448,7 +430,9 @@ pub fn reveal_path(path: &Path) {
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
-    if let Some(p) = path.parent() {
-        let _ = std::process::Command::new("xdg-open").arg(p).spawn();
+    {
+        if let Some(p) = path.parent() {
+            let _ = std::process::Command::new("xdg-open").arg(p).spawn();
+        }
     }
 }

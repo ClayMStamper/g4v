@@ -68,12 +68,7 @@ pub fn parse_log(text: &str) -> Vec<Commit> {
                 author: f[2].to_string(),
                 email: f[3].to_string(),
                 time: f[4].parse().unwrap_or(0),
-                refs: f[5]
-                    .split(", ")
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect(),
+                refs: f[5].split(", ").map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect(),
                 subject: f[6].trim_end().to_string(),
             })
         })
@@ -88,11 +83,7 @@ pub fn parse_name_status(bytes: &[u8]) -> Vec<ChangedFile> {
     while i < parts.len() {
         let code = parts[i].chars().next().unwrap_or('M');
         if (code == 'R' || code == 'C') && i + 2 < parts.len() {
-            out.push(ChangedFile {
-                status: code,
-                old_path: Some(parts[i + 1].clone()),
-                path: parts[i + 2].clone(),
-            });
+            out.push(ChangedFile { status: code, old_path: Some(parts[i + 1].clone()), path: parts[i + 2].clone() });
             i += 3;
         } else if i + 1 < parts.len() {
             out.push(ChangedFile { status: code, path: parts[i + 1].clone(), old_path: None });
@@ -125,12 +116,7 @@ pub fn build_graph(commits: &[Commit]) -> Vec<GraphRow> {
         let mut row = GraphRow::default();
         let before = lanes.clone();
         // Lane(s) that were waiting for this commit.
-        let waiting: Vec<usize> = before
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.as_deref() == Some(c.id.as_str()))
-            .map(|(i, _)| i)
-            .collect();
+        let waiting: Vec<usize> = before.iter().enumerate().filter(|(_, l)| l.as_deref() == Some(c.id.as_str())).map(|(i, _)| i).collect();
         let node = match waiting.first() {
             Some(&i) => i,
             None => match lanes.iter().position(|l| l.is_none()) {
@@ -182,14 +168,7 @@ pub fn build_graph(commits: &[Commit]) -> Vec<GraphRow> {
         while lanes.last().is_some_and(|l| l.is_none()) {
             lanes.pop();
         }
-        let max_col = row
-            .up
-            .iter()
-            .chain(row.down.iter())
-            .flat_map(|(a, b)| [*a, *b])
-            .chain([node])
-            .max()
-            .unwrap_or(0);
+        let max_col = row.up.iter().chain(row.down.iter()).flat_map(|(a, b)| [*a, *b]).chain([node]).max().unwrap_or(0);
         row.width = max_col + 1;
         rows.push(row);
     }
@@ -198,12 +177,7 @@ pub fn build_graph(commits: &[Commit]) -> Vec<GraphRow> {
 
 impl Repo {
     pub fn log(&self, scope: &HistoryScope, limit: usize, has_upstream: bool) -> GitResult<Vec<Commit>> {
-        let mut cmd = self
-            .git()
-            .arg("log")
-            .arg(format!("--format={FORMAT}"))
-            .arg(format!("-n{limit}"))
-            .arg("--date-order");
+        let mut cmd = self.git().arg("log").arg(format!("--format={FORMAT}")).arg(format!("-n{limit}")).arg("--date-order");
         match scope {
             HistoryScope::Current => {
                 cmd = cmd.arg("HEAD");
@@ -221,9 +195,7 @@ impl Repo {
         let out = match cmd.quiet().run() {
             Ok(o) => o,
             // A brand-new repository has no commits yet.
-            Err(e) if e.stderr.contains("does not have any commits") || e.stderr.contains("unknown revision") => {
-                return Ok(Vec::new())
-            }
+            Err(e) if e.stderr.contains("does not have any commits") || e.stderr.contains("unknown revision") => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
         Ok(parse_log(&out.text()))
@@ -252,24 +224,14 @@ impl Repo {
             subject: message.lines().next().unwrap_or_default().to_string(),
         };
         let files = self.commit_files(&commit)?;
-        Ok(CommitDetail {
-            committer: f[6].to_string(),
-            commit_time: f[7].parse().unwrap_or(0),
-            commit,
-            message,
-            files,
-        })
+        Ok(CommitDetail { committer: f[6].to_string(), commit_time: f[7].parse().unwrap_or(0), commit, message, files })
     }
 
     pub fn commit_files(&self, c: &Commit) -> GitResult<Vec<ChangedFile>> {
         let out = if let Some(parent) = c.parents.first() {
             self.git().args(["diff", "--no-ext-diff", "-z", "--name-status", "-M"]).arg(parent).arg(&c.id).quiet().run()?
         } else {
-            self.git()
-                .args(["diff-tree", "--no-commit-id", "-r", "-z", "--name-status", "--root", "-M"])
-                .arg(&c.id)
-                .quiet()
-                .run()?
+            self.git().args(["diff-tree", "--no-commit-id", "-r", "-z", "--name-status", "--root", "-M"]).arg(&c.id).quiet().run()?
         };
         Ok(parse_name_status(&out.stdout))
     }

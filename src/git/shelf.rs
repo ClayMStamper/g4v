@@ -46,10 +46,8 @@ impl Shelf {
 
 /// Makes a string safe for a ref path component.
 pub fn slug(s: &str) -> String {
-    let mut out: String = s
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c.to_ascii_lowercase() } else { '-' })
-        .collect();
+    let mut out: String =
+        s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c.to_ascii_lowercase() } else { '-' }).collect();
     while out.contains("--") {
         out = out.replace("--", "-");
     }
@@ -95,10 +93,7 @@ impl Repo {
             });
         }
         std::fs::create_dir_all(self.meta_dir()).ok();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         let idx = TempIndex(self.meta_dir().join(format!("shelve-index-{}-{nanos}", std::process::id())));
         let idx_path = idx.0.as_os_str().to_os_string();
 
@@ -187,11 +182,8 @@ impl Repo {
             });
         }
         // Mark local shelves that are mirrored on a remote, and hide the duplicate remote entry.
-        let remote_copies: Vec<(String, String)> = shelves
-            .iter()
-            .filter(|s| s.remote.is_some())
-            .map(|s| (s.name.clone(), s.id.clone()))
-            .collect();
+        let remote_copies: Vec<(String, String)> =
+            shelves.iter().filter(|s| s.remote.is_some()).map(|s| (s.name.clone(), s.id.clone())).collect();
         for s in shelves.iter_mut().filter(|s| s.remote.is_none()) {
             s.shared = remote_copies.iter().any(|(n, id)| *n == s.name && *id == s.id);
         }
@@ -216,10 +208,7 @@ impl Repo {
     /// Callers should back up overlapping local edits first.
     pub fn unshelve(&self, shelf: &Shelf, only: Option<&[String]>) -> GitResult<Vec<String>> {
         let files = self.shelf_files(shelf)?;
-        let selected: Vec<&ChangedFile> = files
-            .iter()
-            .filter(|f| only.is_none_or(|o| o.contains(&f.path)))
-            .collect();
+        let selected: Vec<&ChangedFile> = files.iter().filter(|f| only.is_none_or(|o| o.contains(&f.path))).collect();
         let restore: Vec<String> = selected.iter().filter(|f| f.status != 'D').map(|f| f.path.clone()).collect();
         let delete: Vec<String> = selected.iter().filter(|f| f.status == 'D').map(|f| f.path.clone()).collect();
         if !restore.is_empty() {
@@ -252,28 +241,16 @@ impl Repo {
 
     /// Pushes a local shelf so teammates can see it.
     pub fn share_shelf(&self, shelf: &Shelf, remote: &str) -> GitResult<()> {
-        self.git()
-            .arg("push")
-            .arg(remote)
-            .arg(format!("{}:{}{}", shelf.refname, LOCAL_PREFIX, shelf.name))
-            .run()?;
+        self.git().arg("push").arg(remote).arg(format!("{}:{}{}", shelf.refname, LOCAL_PREFIX, shelf.name)).run()?;
         // Mirror locally so it shows as shared without a refetch.
-        self.git()
-            .arg("update-ref")
-            .arg(format!("{REMOTE_PREFIX}{remote}/{}", shelf.name))
-            .arg(&shelf.id)
-            .run()?;
+        self.git().arg("update-ref").arg(format!("{REMOTE_PREFIX}{remote}/{}", shelf.name)).arg(&shelf.id).run()?;
         Ok(())
     }
 
     /// Removes a shelf from the server.
     pub fn unshare_shelf(&self, name: &str, remote: &str) -> GitResult<()> {
         self.git().arg("push").arg(remote).arg("--delete").arg(format!("{LOCAL_PREFIX}{name}")).run()?;
-        let _ = self
-            .git()
-            .args(["update-ref", "-d"])
-            .arg(format!("{REMOTE_PREFIX}{remote}/{name}"))
-            .run();
+        let _ = self.git().args(["update-ref", "-d"]).arg(format!("{REMOTE_PREFIX}{remote}/{name}")).run();
         Ok(())
     }
 

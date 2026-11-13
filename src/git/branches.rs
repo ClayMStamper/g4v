@@ -61,6 +61,27 @@ pub struct Stash {
     pub message: String,
 }
 
+/// Fast, process-free check of a branch name (mirrors `git check-ref-format --branch`).
+pub fn branch_name_problem_local(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("Enter a name.".into());
+    }
+    if name.contains(' ') {
+        return Some("Branch names cannot contain spaces (try dashes: my-feature).".into());
+    }
+    let bad_chars = ['~', '^', ':', '?', '*', '[', '\\'];
+    if name.chars().any(|c| bad_chars.contains(&c) || c.is_control()) {
+        return Some("Branch names cannot contain ~ ^ : ? * [ or \\".into());
+    }
+    if name.starts_with('-') || name.starts_with('/') || name.ends_with('/') || name.ends_with('.') || name.ends_with(".lock") {
+        return Some("That is not a valid branch name.".into());
+    }
+    if name.contains("..") || name.contains("//") || name.contains("@{") || name == "@" || name.split('/').any(|c| c.starts_with('.')) {
+        return Some("That is not a valid branch name.".into());
+    }
+    None
+}
+
 impl Repo {
     pub fn branches(&self) -> GitResult<Vec<BranchRef>> {
         let out = self
@@ -132,13 +153,7 @@ impl Repo {
     /// Creates a local branch tracking `remote_branch` (e.g. `origin/feature`) and switches to it.
     pub fn checkout_remote_branch(&self, remote_branch: &str) -> GitResult<()> {
         let local = remote_branch.split_once('/').map(|(_, b)| b).unwrap_or(remote_branch);
-        let exists = self
-            .git()
-            .args(["show-ref", "--verify", "--quiet"])
-            .arg(format!("refs/heads/{local}"))
-            .quiet()
-            .run()
-            .is_ok();
+        let exists = self.git().args(["show-ref", "--verify", "--quiet"]).arg(format!("refs/heads/{local}")).quiet().run().is_ok();
         if exists {
             self.switch_branch(local)
         } else {
@@ -264,12 +279,7 @@ impl Repo {
                     Some(i) if tail.ends_with(')') => &tail[..i],
                     _ => tail,
                 };
-                Some(Submodule {
-                    path: path.to_string(),
-                    initialized: flag != '-',
-                    out_of_sync: flag == '+',
-                    conflicted: flag == 'U',
-                })
+                Some(Submodule { path: path.to_string(), initialized: flag != '-', out_of_sync: flag == '+', conflicted: flag == 'U' })
             })
             .collect()
     }
@@ -309,6 +319,14 @@ impl Repo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_branch_validation() {
+        assert!(branch_name_problem_local("feature/new-level").is_none());
+        for bad in ["a b", "a..b", "-x", "x/", "x.lock", "a~1", "a:b", "x/.hidden", "a@{b"] {
+            assert!(branch_name_problem_local(bad).is_some(), "{bad}");
+        }
+    }
+
     #[test]
     fn track_parsing() {
         assert_eq!(parse_track("[ahead 1, behind 2]"), (1, 2, false));

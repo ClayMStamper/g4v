@@ -79,11 +79,7 @@ pub struct GitError {
 
 impl fmt::Display for GitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let msg = if !self.stderr.trim().is_empty() {
-            self.stderr.trim()
-        } else {
-            self.stdout.trim()
-        };
+        let msg = if !self.stderr.trim().is_empty() { self.stderr.trim() } else { self.stdout.trim() };
         if msg.is_empty() {
             write!(f, "`{}` failed (exit code {:?})", self.command, self.code)
         } else {
@@ -112,11 +108,7 @@ impl GitOutput {
 
 /// Splits NUL separated output into owned strings, dropping the empty tail.
 pub fn split_nul(bytes: &[u8]) -> Vec<String> {
-    bytes
-        .split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).into_owned())
-        .collect()
+    bytes.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect()
 }
 
 /// Splits NUL separated output keeping empty fields (except the trailing one).
@@ -202,17 +194,12 @@ impl Repo {
             anyhow::bail!("The folder {} does not exist.", path.display());
         }
         let mut cmd = Command::new(git_exe());
-        cmd.current_dir(path)
-            .args(["rev-parse", "--is-bare-repository", "--show-toplevel", "--absolute-git-dir"]);
+        cmd.current_dir(path).args(["rev-parse", "--is-bare-repository", "--show-toplevel", "--absolute-git-dir"]);
         apply_safe_env(&mut cmd);
         hide_window(&mut cmd);
         let out = cmd.output().map_err(|e| anyhow::anyhow!("Could not run git: {e}"))?;
         if !out.status.success() {
-            anyhow::bail!(
-                "{} is not inside a Git repository.\n{}",
-                path.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+            anyhow::bail!("{} is not inside a Git repository.\n{}", path.display(), String::from_utf8_lossy(&out.stderr).trim());
         }
         let text = String::from_utf8_lossy(&out.stdout);
         let mut lines = text.lines();
@@ -242,10 +229,7 @@ impl Repo {
 
     /// Short display name (folder name).
     pub fn name(&self) -> String {
-        self.root
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.root.display().to_string())
+        self.root.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| self.root.display().to_string())
     }
 
     /// Directory where g4v keeps its own per-repository metadata.
@@ -259,14 +243,7 @@ impl Repo {
     }
 
     pub fn git(&self) -> GitCmd<'_> {
-        GitCmd {
-            repo: self,
-            args: Vec::new(),
-            stdin: None,
-            envs: Vec::new(),
-            ok_codes: vec![0],
-            quiet: false,
-        }
+        GitCmd { repo: self, args: Vec::new(), stdin: None, envs: Vec::new(), ok_codes: vec![0], quiet: false }
     }
 
     /// Convenience: run with args and return trimmed stdout.
@@ -384,16 +361,9 @@ impl<'a> GitCmd<'a> {
         }
         hide_window(&mut cmd);
 
-        let fail = |stderr: String, code: Option<i32>, stdout: String| GitError {
-            command: display.clone(),
-            code,
-            stderr,
-            stdout,
-        };
+        let fail = |stderr: String, code: Option<i32>, stdout: String| GitError { command: display.clone(), code, stderr, stdout };
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| fail(format!("Could not start git: {e}"), None, String::new()))?;
+        let mut child = cmd.spawn().map_err(|e| fail(format!("Could not start git: {e}"), None, String::new()))?;
         // Write stdin from a helper thread so large inputs can't deadlock with stdout.
         let writer = match (self.stdin, child.stdin.take()) {
             (Some(data), Some(mut pipe)) => Some(std::thread::spawn(move || {
@@ -401,9 +371,7 @@ impl<'a> GitCmd<'a> {
             })),
             _ => None,
         };
-        let out = child
-            .wait_with_output()
-            .map_err(|e| fail(format!("git did not finish: {e}"), None, String::new()))?;
+        let out = child.wait_with_output().map_err(|e| fail(format!("git did not finish: {e}"), None, String::new()))?;
         if let Some(w) = writer {
             let _ = w.join();
         }
@@ -441,10 +409,7 @@ pub fn run_global(args: &[&OsStr], cwd: Option<&Path>, log: &CmdLog) -> GitResul
     cmd.args(args).stdin(Stdio::null());
     apply_safe_env(&mut cmd);
     hide_window(&mut cmd);
-    let display = format!(
-        "git {}",
-        args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" ")
-    );
+    let display = format!("git {}", args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
     let out = cmd.output().map_err(|e| GitError {
         command: display.clone(),
         code: None,
