@@ -281,37 +281,48 @@ fn show_diff(ui: &mut Ui, d: &DiffData, textures: &(Option<egui::TextureHandle>,
 }
 
 fn image_compare(ui: &mut Ui, textures: &(Option<egui::TextureHandle>, Option<egui::TextureHandle>)) {
+    // The images are fitted to the space the panel has *right now*. The content must never be taller or wider than
+    // that space: egui persists a resizable panel's size from its content, so an overflowing preview would make the
+    // panel grow back to fit it the moment the user releases the resize handle (the "snaps back to full size" bug).
+    // Reserve the real height of the label above and the dimensions line below each image (plus spacing), and wrap
+    // everything in a scroll area so an unusually small panel scrolls instead of growing.
     let avail = ui.available_size();
-    let w = (avail.x - 20.0) / 2.0;
-    let h = (avail.y - 30.0).max(60.0);
-    ui.horizontal_top(|ui| {
-        for (label, tex) in [("Before", &textures.0), ("After", &textures.1)] {
-            ui.vertical(|ui| {
-                ui.label(theme::strong(label));
-                match tex {
-                    Some(t) => {
-                        let size = t.size_vec2();
-                        let scale = (w / size.x).min(h / size.y).min(4.0);
-                        let disp = size * scale;
-                        let (rect, _) = ui.allocate_exact_size(disp, egui::Sense::hover());
-                        checkerboard(ui, rect);
-                        ui.painter().image(
-                            t.id(),
-                            rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            Color32::WHITE,
-                        );
-                        ui.label(theme::small(format!("{} × {}", size.x as u32, size.y as u32)));
+    let spacing = ui.spacing().item_spacing;
+    let gap = 12.0;
+    let label_h = ui.text_style_height(&egui::TextStyle::Body).max(ui.text_style_height(&egui::TextStyle::Small));
+    let overhead = label_h * 2.0 + spacing.y * 3.0 + 6.0;
+    let w = ((avail.x - 2.0 * (gap + spacing.x) - 4.0) / 2.0).max(40.0);
+    let h = (avail.y - overhead).max(40.0);
+    egui::ScrollArea::both().id_salt("image_compare_scroll").auto_shrink([false, false]).show(ui, |ui| {
+        ui.horizontal_top(|ui| {
+            for (label, tex) in [("Before", &textures.0), ("After", &textures.1)] {
+                ui.vertical(|ui| {
+                    ui.label(theme::strong(label));
+                    match tex {
+                        Some(t) => {
+                            let size = t.size_vec2();
+                            let scale = (w / size.x).min(h / size.y).min(4.0);
+                            let disp = size * scale;
+                            let (rect, _) = ui.allocate_exact_size(disp, egui::Sense::hover());
+                            checkerboard(ui, rect);
+                            ui.painter().image(
+                                t.id(),
+                                rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                            ui.label(theme::small(format!("{} × {}", size.x as u32, size.y as u32)));
+                        }
+                        None => {
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(w.min(200.0), 60.0), egui::Sense::hover());
+                            ui.painter().rect_stroke(rect, 4.0, egui::Stroke::new(1.0, MUTED), egui::StrokeKind::Inside);
+                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "(none)", egui::FontId::proportional(13.0), MUTED);
+                        }
                     }
-                    None => {
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(w.min(200.0), 60.0), egui::Sense::hover());
-                        ui.painter().rect_stroke(rect, 4.0, egui::Stroke::new(1.0, MUTED), egui::StrokeKind::Inside);
-                        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "(none)", egui::FontId::proportional(13.0), MUTED);
-                    }
-                }
-            });
-            ui.add_space(12.0);
-        }
+                });
+                ui.add_space(gap);
+            }
+        });
     });
 }
 
@@ -331,5 +342,46 @@ fn checkerboard(ui: &Ui, rect: egui::Rect) {
         }
         y += s;
         row += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a PNG preview used to be sized to the whole panel, so once the user released the resize handle the
+    /// panel grew to fit the image and the image scaled back up. The panel must keep the size it was given.
+    #[test]
+    fn image_preview_does_not_grow_resizable_panel() {
+        let ctx = egui::Context::default();
+        let mut textures: (Option<egui::TextureHandle>, Option<egui::TextureHandle>) = (None, None);
+        let mut heights = Vec::new();
+        for frame in 0..8 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+                ..Default::default()
+            };
+            let mut h = 0.0;
+            let mut out = ctx.run_ui(raw, |ui| {
+                if textures.0.is_none() {
+                    let img = egui::ColorImage::filled([800, 600], Color32::RED);
+                    let tex = ui.ctx().load_texture("t", img, egui::TextureOptions::LINEAR);
+                    textures = (Some(tex.clone()), Some(tex));
+                }
+                let r = egui::Panel::bottom("detail_test").resizable(true).default_size(240.0).min_size(120.0).show_inside(ui, |ui| {
+                    ui.label("title");
+                    ui.label("Size: 1 KB ➡ 2 KB");
+                    image_compare(ui, &textures);
+                });
+                h = r.response.rect.height();
+            });
+            out.textures_delta.clear();
+            heights.push((frame, h));
+        }
+        let first = heights[0].1;
+        for (frame, h) in &heights {
+            assert!((h - first).abs() < 0.5, "panel height changed on frame {frame}: {h} vs {first} ({heights:?})");
+        }
+        assert!(first < 260.0, "panel grew past its default size: {first}");
     }
 }
