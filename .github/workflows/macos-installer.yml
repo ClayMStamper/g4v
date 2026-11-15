@@ -4,6 +4,8 @@ on:
   workflow_dispatch:
   push:
     tags: ['v*']
+    # Branch pushes build only when the installer itself changes (path filters don't apply to tags).
+    branches: ['**']
     paths:
       - 'installer/macos/**'
       - '.github/workflows/macos-installer.yml'
