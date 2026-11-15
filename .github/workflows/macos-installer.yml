@@ -1,0 +1,25 @@
+name: macOS installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+    paths:
+      - 'installer/macos/**'
+      - '.github/workflows/macos-installer.yml'
+
+jobs:
+  dmg:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: bash installer/macos/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: g4v-macos-dmg
+          path: dist/*.dmg
+          if-no-files-found: error

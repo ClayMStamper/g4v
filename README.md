@@ -135,6 +135,25 @@ This produces `dist\g4v-setup-<version>.exe`, a single self-contained installer.
 *Settings › Apps* so it can be uninstalled normally. Unattended use: `g4v-setup.exe --silent [--dir PATH]` and
 `uninstall.exe --uninstall --silent`. Uninstalling never touches your repositories or g4v settings.
 
+### macOS installer
+
+On a Mac with the Xcode Command Line Tools and rustup:
+
+```bash
+installer/macos/build.sh
+```
+
+This produces `dist/g4v-<version>-macos.dmg`, a disk image with a universal (Apple Silicon + Intel) `g4v.app` and an
+*Applications* shortcut: open it and drag g4v into Applications. It needs macOS 11 or later. Pass `--native` to
+build only for the Mac you're on, which is faster. You don't need a Mac for this: run the **macOS installer** workflow
+from the Actions tab (it also runs on `v*` tags) and download the `.dmg` from the run's artifacts.
+
+By default the app is ad-hoc signed, so on first launch of a downloaded copy macOS asks you to confirm it:
+right-click g4v in Applications and choose **Open**. To sign and notarize, set `G4V_SIGN_IDENTITY` to your
+*Developer ID Application* identity and `G4V_NOTARY_PROFILE` to a `notarytool` keychain profile before building.
+g4v uses the `git` and `git-lfs` on your system and also looks in the Homebrew and MacPorts folders, so
+`brew install git git-lfs` is all you need.
+
 To make binary files lockable (Perforce-style exclusive check-out):
 
 ```bash
