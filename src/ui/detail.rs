@@ -316,7 +316,13 @@ fn image_compare(ui: &mut Ui, textures: &(Option<egui::TextureHandle>, Option<eg
                         None => {
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(w.min(200.0), 60.0), egui::Sense::hover());
                             ui.painter().rect_stroke(rect, 4.0, egui::Stroke::new(1.0, MUTED), egui::StrokeKind::Inside);
-                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "(none)", egui::FontId::proportional(13.0), MUTED);
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "(none)",
+                                egui::FontId::proportional(13.0),
+                                MUTED,
+                            );
                         }
                     }
                 });
@@ -368,7 +374,7 @@ mod tests {
                     let tex = ui.ctx().load_texture("t", img, egui::TextureOptions::LINEAR);
                     textures = (Some(tex.clone()), Some(tex));
                 }
-                let r = egui::Panel::bottom("detail_test").resizable(true).default_size(240.0).min_size(120.0).show_inside(ui, |ui| {
+                let r = egui::Panel::bottom("detail_test").resizable(true).default_size(240.0).min_size(120.0).show(ui, |ui| {
                     ui.label("title");
                     ui.label("Size: 1 KB ➡ 2 KB");
                     image_compare(ui, &textures);
